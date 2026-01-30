@@ -872,7 +872,8 @@ class Diffusion(L.LightningModule):
 
   def sample(
     self,
-    eps=1e-5):  # Note: differs from self.config.training.sampling_eps
+    eps=1e-5,  # Note: differs from self.config.training.sampling_eps
+    use_shs: bool = False):
     """Generate samples from (ema) model.
 
       Supports both AR and diffusion sampling.
@@ -908,9 +909,14 @@ class Diffusion(L.LightningModule):
       samples = self._ar_sample(
         classifier_model=classifier_model, cond=cond)
     else:  # Diffusion sampling
-      samples = self._diffusion_sample(
-        classifier_model=classifier_model, cond=cond,
-        eps=eps)
+      if use_shs:
+        samples = self._diffusion_sample_shs(
+          classifier_model=classifier_model, cond=cond,
+          eps=eps)
+      else:
+        samples = self._diffusion_sample(
+          classifier_model=classifier_model, cond=cond,
+          eps=eps)
     if not self.config.eval.disable_ema:
       self._restore_non_ema_params()
     return samples
@@ -1110,7 +1116,244 @@ class Diffusion(L.LightningModule):
       i: int,
   ):
     raise NotImplementedError
+  
+  @torch.no_grad()
+  def _diffusion_sample_shs(
+    self,
+    classifier_model: typing.Optional[classifier.Classifier] = None,
+    cond: typing.Optional[torch.tensor] = None,
+    eps: float = 1e-5,  # Note: differs from self.config.training.sampling_eps
+  ):
+    """Generate samples using diffusion sampling.
 
+    For unconditional sampling (config.guidance is None), this implements
+    Stratified Hazard Sampling (SHS) for the per-position *jump/stay*
+    decisions, following Algorithm 1 in the SHS paper.
+
+    Concretely, at each step we compute the usual per-position transition
+    distribution q(x_s | x_t) (named `q_xs` in this codebase). We then:
+      - define per-step jump mass p_jump = 1 - q_xs[ current_token ],
+      - accumulate S += p_jump (discretized cumulative hazard),
+      - trigger a jump deterministically when S crosses (theta + k),
+      - sample the new token from q_xs(· | jump) (i.e., q_xs with the
+        current token removed and renormalized).
+
+    Guidance-based sampling (CFG/CBG/NOS) is left unchanged (tau-leap style).
+    """
+    xt = self._sample_prior(
+      self.config.sampling.batch_size,
+      self.config.model.length
+    ).to(self.device)
+
+    timesteps = torch.linspace(
+      1, eps, self.config.sampling.steps + 1, device=self.device)
+    dt = (1 - eps) / self.config.sampling.steps
+
+    pbar = tqdm(range(self.config.sampling.steps),
+                desc='Sampling',
+                leave=False)
+
+    # NOTE: NFEs accounting in this codebase is approximate (e.g., CFG can
+    # do 2 forward passes). We keep the existing convention.
+    NFEs = 0
+    cache: typing.Optional[typing.Dict[str, torch.Tensor]] = None
+
+    # --- SHS state (only used when guidance is None) ---
+    if getattr(self.config, 'guidance', None) is None:
+      hazard_dtype = torch.float64 if self.config.sampling.use_float64 else torch.float32
+      # Discretized cumulative hazard S_i and jump counter k_i.
+      S = torch.zeros_like(xt, dtype=hazard_dtype)
+      k = torch.zeros_like(xt, dtype=torch.long)
+      # Random phase theta_i ~ U(0, 1).
+      theta = torch.rand(xt.shape, device=xt.device, dtype=hazard_dtype)
+
+    for i in pbar:
+      t = timesteps[i]
+      if self.T > 0:  # t in {1/T,..., 1}, to match training
+        t = (t * self.T).to(torch.int)
+        t = t / self.T
+        t += (1 / self.T)
+
+      t = t * torch.ones(xt.shape[0], 1, device=self.device)
+
+      sigma_t, _ = self.noise(t)
+      sigma_s, _ = self.noise(t - dt)
+
+      if sigma_t.ndim > 1:
+        sigma_t = sigma_t.squeeze(-1)
+      if sigma_s.ndim > 1:
+        sigma_s = sigma_s.squeeze(-1)
+
+      assert sigma_t.ndim == 1, sigma_t.shape
+      assert sigma_s.ndim == 1, sigma_s.shape
+
+      # `move_chance_*` defines the (discrete) reverse transition kernel.
+      move_chance_t = 1 - torch.exp(-sigma_t)
+      move_chance_s = 1 - torch.exp(-sigma_s)
+      move_chance_t = move_chance_t[:, None, None]
+      move_chance_s = move_chance_s[:, None, None]
+      assert move_chance_t.ndim == 3, move_chance_t.shape
+
+      if getattr(self.config, 'guidance', None) is None:
+        # =========================
+        #   Unconditional SHS path
+        # =========================
+
+        # Use processed sigma for the *model* input (important when
+        # `time_conditioning=False`, where the model ignores sigma and can
+        # be safely cached across time).
+        time_conditioning = self._process_sigma(sigma_t)
+
+        # Compute log_x_theta (optionally cached).
+        use_cache = bool(getattr(self.config.sampling, 'use_cache', False))
+        reuse_cache = (
+          use_cache and cache is not None
+          and ('log_x_theta' in cache)
+          and ('time_conditioning' in cache)
+          and torch.allclose(cache['time_conditioning'], time_conditioning)
+        )
+        if reuse_cache:
+          log_x_theta = cache['log_x_theta']
+        else:
+          NFEs += 1
+          log_x_theta = self.forward(xt, time_conditioning, cond=None)
+          if self.config.sampling.use_float64:
+            log_x_theta = log_x_theta.to(torch.float64)
+
+        x_theta = log_x_theta.exp()
+
+        # Compute the usual per-step posterior q(x_s | x_t).
+        if self.diffusion == 'absorbing_state':
+          q_xs = x_theta * (move_chance_t - move_chance_s)
+          q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+          q_xs = q_xs / move_chance_t
+        elif self.diffusion == 'uniform':
+          q_xs = self._compute_posterior(
+            x=x_theta,
+            xt=xt,
+            alpha_s=1 - move_chance_s,
+            alpha_t=1 - move_chance_t)
+        else:
+          raise NotImplementedError(
+            f"Diffusion type {self.diffusion} not implemented.")
+
+        # --- SHS: hazard accumulation and stratified event triggering ---
+        # p_stay = q_xs(current token), p_jump = 1 - p_stay
+        p_stay = torch.gather(q_xs, -1, xt.unsqueeze(-1)).squeeze(-1)
+        p_jump = (1.0 - p_stay).clamp(0.0, 1.0)
+
+        # For absorbing-state diffusion, once a token is unmasked it must stay.
+        if self.diffusion == 'absorbing_state':
+          copy_flag = (xt != self.mask_index)
+          p_jump = p_jump.masked_fill(copy_flag, 0.0)
+
+        # Accumulate discretized cumulative hazard.
+        # print(S.min(), S.max(), S.std(), S.mean())
+        S = S + p_jump.to(S.dtype)
+
+        # Trigger a jump when S crosses theta + k (unit-spaced strata).
+        threshold = theta + k.to(theta.dtype)
+        jump_mask = (S >= threshold) & (p_jump > 0)
+
+        if self.diffusion == 'absorbing_state':
+          jump_mask = jump_mask & (~copy_flag)
+
+        # Apply jumps (sample destination conditional on jumping).
+        xs = xt.clone()
+        if jump_mask.any():
+          flat_jump = jump_mask.reshape(-1)
+          jump_idx = flat_jump.nonzero(as_tuple=False).squeeze(-1)
+
+          q_sel = q_xs.reshape(-1, q_xs.shape[-1]).index_select(0, jump_idx)
+          xt_sel = xt.reshape(-1).index_select(0, jump_idx)
+
+          # q(· | jump) ∝ q_xs(·) with current token removed.
+          q_sel = q_sel.clone()
+          q_sel.scatter_(1, xt_sel.unsqueeze(1), 0.0)
+          q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+          new_sel = _sample_categorical(q_sel)
+
+          xs_flat = xs.reshape(-1)
+          xs_flat[jump_idx] = new_sel
+          xs = xs_flat.view_as(xs)
+
+          # Update k (jump counter) for jumped positions.
+          k_flat = k.reshape(-1)
+          k_flat[jump_idx] += 1
+          k = k_flat.view_as(k)
+
+        pbar.set_postfix(
+          NFEs=NFEs,
+          prob_check=(q_xs.sum() / xt.numel()).item(),
+          nan_check=bool(q_xs.isnan().sum() > 0))
+
+        # Keep cache only if xt did not change (same as original logic),
+        # but include time_conditioning to ensure correctness when sigma varies.
+        if (not use_cache) or (not torch.equal(xs, xt)):
+          cache = None
+        else:
+          cache = {'log_x_theta': log_x_theta,
+                   'time_conditioning': time_conditioning}
+
+        xt = xs
+        continue
+
+      # =========================
+      #   Guidance path (original)
+      # =========================
+      if cache is None:
+        NFEs += 1
+
+      if self.config.guidance.method == 'cfg':
+        xs, q_xs, cache = self._cfg_denoise(
+          cond=cond,
+          gamma=self.config.guidance.gamma,
+          xt=xt,
+          time_conditioning=sigma_t,
+          move_chance_t=move_chance_t,
+          move_chance_s=move_chance_s,
+          cache=cache)
+      elif self.config.guidance.method == 'cbg':
+        xs, q_xs, cache = self._cbg_denoise(
+          classifier_model=classifier_model,
+          conditioning_class=self.config.guidance.condition,
+          gamma=self.config.guidance.gamma,
+          use_approx=self.config.guidance.use_approx,
+          xt=xt,
+          time_conditioning=sigma_t,
+          move_chance_t=move_chance_t,
+          move_chance_s=move_chance_s,
+          cache=cache)
+      elif self.config.guidance.method == 'nos':
+        xs, q_xs, cache = self._nos_denoise(
+          classifier_model=classifier_model,
+          conditioning_class=self.config.guidance.condition,
+          num_nos_steps=self.config.guidance.num_nos_steps,
+          nos_step_size=self.config.guidance.nos_step_size,
+          nos_stability_coef=self.config.guidance.nos_stability_coef,
+          xt=xt,
+          time_conditioning=sigma_t,
+          move_chance_t=move_chance_t,
+          move_chance_s=move_chance_s)
+      else:
+        raise NotImplementedError(
+          f"Guidance method {self.config.guidance.method} not implemented.")
+
+      pbar.set_postfix(
+        NFEs=NFEs,
+        prob_check=(q_xs.sum() / xt.numel()).item(),
+        nan_check=bool(q_xs.isnan().sum() > 0))
+
+      if (not self.config.sampling.use_cache or
+          not torch.allclose(xs, xt)):
+        # Disable caching
+        cache = None
+      xt = xs
+
+    return xt
+
+  
   @torch.no_grad()
   def _diffusion_sample(
     self,
@@ -1122,7 +1365,6 @@ class Diffusion(L.LightningModule):
       self.config.sampling.batch_size,
       self.config.model.length
     ).to(self.device)
-
     timesteps = torch.linspace(
       1, eps, self.config.sampling.steps + 1, device=self.device)
     dt = (1 - eps) / self.config.sampling.steps
