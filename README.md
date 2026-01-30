@@ -51,7 +51,7 @@ to enable SHS in other evaluation paths.
 
 ## Acknowledgements
 This code is adapted from:
-- **Simple Guidance Mechanisms for Discrete Diffusion Models** 
+- **Simple Guidance Mechanisms for Discrete Diffusion Models**<br>
 [https://github.com/kuleshov-group/discrete-diffusion-guidance]
 
 ## Citation
