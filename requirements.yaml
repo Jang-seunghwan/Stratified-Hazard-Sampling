@@ -13,10 +13,10 @@ dependencies:
   - python=3.9.20
   - pip:
       - biopython==1.84
-      - causal-conv1d==1.4.0
+      # - causal-conv1d==1.4.0
       - datasets==2.18.0
       - einops==0.8.0
-      - flash-attn==2.7.2.post1
+      # - flash-attn==2.7.2.post1
       - fsspec==2024.2.0
       - git-lfs==1.6
       - h5py==3.10.0
@@ -27,7 +27,7 @@ dependencies:
       - jupyterlab==4.1.8
       - lightning==2.2.1
       - lightning-utilities==0.11.9
-      - mamba-ssm==1.2.0.post1
+      # - mamba-ssm==1.2.0.post1
       - matplotlib==3.9.2
       - notebook==7.1.1
       - numpy==1.26.4

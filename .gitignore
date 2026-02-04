@@ -5,3 +5,7 @@ __pycache__/
 .hf_cache
 outputs/
 watch_folder/
+README copy.md
+config_tree.txt
+requirements_copy.yaml
+requirements.yaml
