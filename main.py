@@ -165,7 +165,8 @@ def _gen_ppl_eval(config, tokenizer):
   samples = []
   for _ in tqdm(range(config.sampling.num_sample_batches),
                 desc='Gen. batches', leave=False):
-    sample = pretrained.sample(use_shs=True)
+    use_shs = getattr(config.sampling, 'use_shs', True)
+    sample = pretrained.sample(use_shs=use_shs)
     samples.extend(
       pretrained.tokenizer.batch_decode(sample))
 

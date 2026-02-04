@@ -299,6 +299,10 @@ def get_dataset(
       cache_dir=cache_dir,
       streaming=streaming)
 
+  # Some datasets (e.g., lm1b) only provide train/test splits.
+  if mode in {'valid', 'validation'} and 'validation' not in dataset and 'test' in dataset:
+    mode = 'test'
+
   if dataset_name == 'qm9':
     data = dataset
   else:
