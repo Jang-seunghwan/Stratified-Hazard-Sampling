@@ -162,11 +162,24 @@ def _gen_ppl_eval(config, tokenizer):
   pretrained = _load_from_checkpoint(
     config=config, tokenizer=tokenizer)
   pretrained.eval()
+
+  # Determine sampling mode: 'default', 'shs', or 'shs_safe'
+  # Support both old use_shs boolean and new sampling_mode string
+  sampling_mode = getattr(config.sampling, 'sampling_mode', None)
+  if sampling_mode is None:
+    use_shs = getattr(config.sampling, 'use_shs', True)
+    sampling_mode = 'shs' if use_shs else 'default'
+
+  print(f"[Gen-PPL Eval] Sampling mode: {sampling_mode}")
+  blacklist_percent = getattr(config.sampling, 'blacklist_percent', 0.0)
+  if blacklist_percent > 0:
+    blacklist_seed = getattr(config.sampling, 'blacklist_seed', 42)
+    print(f"[Gen-PPL Eval] Blacklist: {blacklist_percent}% (seed={blacklist_seed})")
+
   samples = []
   for _ in tqdm(range(config.sampling.num_sample_batches),
                 desc='Gen. batches', leave=False):
-    use_shs = getattr(config.sampling, 'use_shs', True)
-    sample = pretrained.sample(use_shs=use_shs)
+    sample = pretrained.sample(sampling_mode=sampling_mode)
     samples.extend(
       pretrained.tokenizer.batch_decode(sample))
 

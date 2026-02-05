@@ -40,6 +40,160 @@ def _unsqueeze(x, reference):
     * ((1,) * (len(reference.shape) - len(x.shape))))
 
 
+def _create_blacklist(vocab_size: int, blacklist_percent: float,
+                      blacklist_seed: int, mask_index: int = -1,
+                      special_token_ids: typing.Optional[typing.List[int]] = None) -> torch.Tensor:
+  """Create a blacklist of token indices (random N% selection).
+
+  Args:
+    vocab_size: Total vocabulary size
+    blacklist_percent: Percentage of vocabulary to blacklist (0-100)
+    blacklist_seed: Random seed for reproducible blacklist generation
+    mask_index: Mask token index to exclude from blacklist candidates
+    special_token_ids: List of special token IDs to exclude from blacklist
+
+  Returns:
+    Boolean tensor of shape (vocab_size,) where True = blacklisted
+  """
+  # Create RNG with specific seed for blacklist only
+  rng = torch.Generator()
+  rng.manual_seed(blacklist_seed)
+
+  # Create list of candidate tokens (exclude special tokens)
+  exclude_set = set()
+  if mask_index >= 0 and mask_index < vocab_size:
+    exclude_set.add(mask_index)
+  if special_token_ids is not None:
+    for tid in special_token_ids:
+      if tid is not None and 0 <= tid < vocab_size:
+        exclude_set.add(tid)
+
+  candidate_indices = [i for i in range(vocab_size) if i not in exclude_set]
+  num_candidates = len(candidate_indices)
+
+  # Number of tokens to blacklist
+  num_blacklist = int(num_candidates * blacklist_percent / 100.0)
+
+  # Random permutation with fixed seed
+  perm = torch.randperm(num_candidates, generator=rng)
+  blacklist_local_indices = perm[:num_blacklist].tolist()
+
+  # Create boolean mask
+  blacklist_mask = torch.zeros(vocab_size, dtype=torch.bool)
+  for local_idx in blacklist_local_indices:
+    blacklist_mask[candidate_indices[local_idx]] = True
+
+  return blacklist_mask
+
+
+def _create_blacklist_from_words(
+    vocab_size: int,
+    tokenizer: transformers.PreTrainedTokenizer,
+    blacklist_words: typing.List[str],
+) -> torch.Tensor:
+  """Create a blacklist from specific words.
+
+  Args:
+    vocab_size: Total vocabulary size
+    tokenizer: Tokenizer to convert words to token IDs
+    blacklist_words: List of words to blacklist
+
+  Returns:
+    Boolean tensor of shape (vocab_size,) where True = blacklisted
+  """
+  blacklist_mask = torch.zeros(vocab_size, dtype=torch.bool)
+  blacklisted_tokens = set()
+
+  for word in blacklist_words:
+    # Encode word to token IDs (may be multiple for subword tokenization)
+    token_ids = tokenizer.encode(word, add_special_tokens=False)
+    for tid in token_ids:
+      if 0 <= tid < vocab_size:
+        blacklist_mask[tid] = True
+        blacklisted_tokens.add((word, tid, tokenizer.decode([tid])))
+
+  return blacklist_mask, blacklisted_tokens
+
+
+def _apply_blacklist_to_probs(probs: torch.Tensor, blacklist_mask: torch.Tensor,
+                               current_tokens: typing.Optional[torch.Tensor] = None,
+                               preserve_stay: bool = False) -> torch.Tensor:
+  """Apply blacklist masking to probability distribution.
+
+  Zeros out blacklisted token probabilities and rescales safe token probabilities.
+
+  Args:
+    probs: Probability tensor of shape (..., vocab_size)
+    blacklist_mask: Boolean tensor of shape (vocab_size,) where True = blacklisted
+    current_tokens: Optional tensor of current token indices (shape matches probs[..., 0])
+    preserve_stay: If True and current_tokens provided, preserve p(stay) and only
+                   redistribute blacklist mass to other safe tokens. This prevents
+                   the increased "stickiness" issue in tau-leap sampling.
+
+  Returns:
+    Modified probability tensor with blacklist applied
+  """
+  # Move blacklist to same device
+  blacklist_mask = blacklist_mask.to(probs.device)
+  safe_mask = ~blacklist_mask  # (vocab_size,)
+
+  if preserve_stay and current_tokens is not None:
+    # Preserve p(stay) strategy:
+    # 1. Get p(stay) for current tokens
+    # 2. Zero out blacklist
+    # 3. Scale only OTHER safe tokens to redistribute blacklist mass
+
+    new_probs = probs.clone()
+
+    # Get p(stay) before any modification
+    p_stay = torch.gather(probs, -1, current_tokens.unsqueeze(-1))  # (..., 1)
+
+    # Check if current token is blacklisted
+    current_is_blacklisted = torch.gather(
+      blacklist_mask.expand_as(probs).float(), -1, current_tokens.unsqueeze(-1)
+    ).bool()  # (..., 1)
+
+    # Zero out blacklist tokens
+    new_probs = new_probs * safe_mask.float()
+
+    # For each position, we need to scale other safe tokens
+    # p_other_safe = p_safe - p_stay (if current is safe)
+    p_safe = (probs * safe_mask.float()).sum(dim=-1, keepdim=True)
+    p_stay_safe = torch.where(current_is_blacklisted, torch.zeros_like(p_stay), p_stay)
+    p_other_safe = p_safe - p_stay_safe
+
+    # Blacklist mass to redistribute
+    p_black = (probs * blacklist_mask.float()).sum(dim=-1, keepdim=True)
+
+    # Scale factor for other safe tokens: (p_other_safe + p_black) / p_other_safe
+    scale_factor = torch.ones_like(p_other_safe)
+    valid_mask = p_other_safe > 1e-10
+    scale_factor[valid_mask] = (p_other_safe[valid_mask] + p_black[valid_mask]) / p_other_safe[valid_mask]
+
+    # Apply scaling to all, then restore p(stay) for safe current tokens
+    new_probs = new_probs * scale_factor
+
+    # Restore original p(stay) for safe current tokens
+    if not current_is_blacklisted.all():
+      new_probs.scatter_(-1, current_tokens.unsqueeze(-1),
+                         torch.where(current_is_blacklisted, torch.zeros_like(p_stay), p_stay))
+
+    return new_probs
+
+  else:
+    # Original behavior: uniform scaling of all safe tokens
+    p_safe = (probs * safe_mask.float()).sum(dim=-1, keepdim=True)
+
+    scale_factor = torch.ones_like(p_safe)
+    valid_mask = p_safe > 1e-10
+    scale_factor[valid_mask] = 1.0 / p_safe[valid_mask]
+
+    new_probs = probs.clone()
+    new_probs = new_probs * safe_mask.float() * scale_factor
+
+    return new_probs
+
+
 @dataclass
 class Loss:
   loss: torch.FloatTensor
@@ -852,14 +1006,25 @@ class Diffusion(L.LightningModule):
               columns=['Generated Samples'],
               data=[[s] for s in decoded_samples])
 
-  def _sample_prior(self, *batch_dims):
+  def _sample_prior(self, *batch_dims, blacklist_mask: typing.Optional[torch.Tensor] = None):
     if self.diffusion == 'absorbing_state':
       return self.mask_index * torch.ones(
         *batch_dims, dtype=torch.int64, device=self.device)
     if self.diffusion == 'uniform':
-      return torch.randint(
-        0, self.vocab_size, batch_dims, dtype=torch.int64,
-        device=self.device)
+      if blacklist_mask is None:
+        return torch.randint(
+          0, self.vocab_size, batch_dims, dtype=torch.int64,
+          device=self.device)
+      else:
+        # Sample only from safe (non-blacklisted) tokens
+        blacklist_mask = blacklist_mask.to(self.device)
+        safe_indices = (~blacklist_mask).nonzero(as_tuple=False).squeeze(-1)
+        num_safe = safe_indices.shape[0]
+        # Sample indices into safe_indices
+        sampled_local = torch.randint(
+          0, num_safe, batch_dims, dtype=torch.int64, device=self.device)
+        # Map back to actual token indices
+        return safe_indices[sampled_local.reshape(-1)].reshape(batch_dims)
     elif self.diffusion == 'uniform_data_marginals':
       if self.limiting_distribution.squeeze().ndim == 2:
         batch_dims = (batch_dims[0],)
@@ -873,7 +1038,8 @@ class Diffusion(L.LightningModule):
   def sample(
     self,
     eps=1e-5,  # Note: differs from self.config.training.sampling_eps
-    use_shs: bool = False):
+    use_shs: bool = False,
+    sampling_mode: typing.Optional[str] = None):
     """Generate samples from (ema) model.
 
       Supports both AR and diffusion sampling.
@@ -883,10 +1049,70 @@ class Diffusion(L.LightningModule):
         - classifier-based guidance
           - CBG / FUDGE,
           - NOS / PPLM.
+
+      Args:
+        eps: Epsilon for timestep bounds
+        use_shs: Deprecated, use sampling_mode instead. If True and sampling_mode is None,
+                 defaults to 'shs'
+        sampling_mode: One of 'default', 'shs', 'shs_safe'. If None, uses use_shs for backwards compat
     """
     # WARNING: Lightning auto-casting is not working in this method.
     if not self.config.eval.disable_ema:
       self.load_ema_params()
+
+    # Handle backwards compatibility and determine actual sampling mode
+    if sampling_mode is None:
+      sampling_mode = 'shs' if use_shs else 'default'
+
+    # Setup blacklist if configured (supports both percentage-based and word-based)
+    blacklist_mask = None
+    blacklist_percent = getattr(self.config.sampling, 'blacklist_percent', 0.0)
+    blacklist_words = getattr(self.config.sampling, 'blacklist_words', None)
+
+    # Word-based blacklist (specific banned words)
+    if blacklist_words is not None and len(blacklist_words) > 0:
+      # Convert string to list if needed (e.g., comma-separated)
+      if isinstance(blacklist_words, str):
+        blacklist_words = [w.strip() for w in blacklist_words.split(',') if w.strip()]
+
+      word_mask, blacklisted_tokens = _create_blacklist_from_words(
+        vocab_size=self.vocab_size,
+        tokenizer=self.tokenizer,
+        blacklist_words=blacklist_words
+      )
+      blacklist_mask = word_mask.to(self.device)
+      print(f"[Blacklist] Word-based: {len(blacklist_words)} words -> "
+            f"{blacklist_mask.sum().item()} tokens blacklisted")
+      for word, tid, decoded in sorted(blacklisted_tokens, key=lambda x: x[0]):
+        print(f"  - '{word}' -> token {tid} ('{decoded}')")
+
+    # Percentage-based blacklist (random N% of vocabulary)
+    if blacklist_percent > 0:
+      blacklist_seed = getattr(self.config.sampling, 'blacklist_seed', 42)
+      special_tokens = [
+        self.tokenizer.pad_token_id,
+        self.tokenizer.bos_token_id,
+        self.tokenizer.eos_token_id,
+        self.tokenizer.cls_token_id if hasattr(self.tokenizer, 'cls_token_id') else None,
+        self.tokenizer.sep_token_id if hasattr(self.tokenizer, 'sep_token_id') else None,
+      ]
+      percent_mask = _create_blacklist(
+        vocab_size=self.vocab_size,
+        blacklist_percent=blacklist_percent,
+        blacklist_seed=blacklist_seed,
+        mask_index=self.mask_index,
+        special_token_ids=special_tokens
+      ).to(self.device)
+
+      # Combine with word-based blacklist if both exist
+      if blacklist_mask is not None:
+        blacklist_mask = blacklist_mask | percent_mask
+        print(f"[Blacklist] Combined: {blacklist_mask.sum().item()}/{self.vocab_size} tokens total")
+      else:
+        blacklist_mask = percent_mask
+        print(f"[Blacklist] {blacklist_mask.sum().item()}/{self.vocab_size} tokens blacklisted "
+              f"({blacklist_percent:.1f}%, seed={blacklist_seed})")
+
     if getattr(self.config, 'guidance', None) is not None:
       if self.config.guidance.method == 'cfg':
         cond = (torch.ones(self.config.sampling.batch_size, device=self.device) *
@@ -909,14 +1135,18 @@ class Diffusion(L.LightningModule):
       samples = self._ar_sample(
         classifier_model=classifier_model, cond=cond)
     else:  # Diffusion sampling
-      if use_shs:
+      if sampling_mode == 'shs':
         samples = self._diffusion_sample_shs(
           classifier_model=classifier_model, cond=cond,
-          eps=eps)
-      else:
+          eps=eps, blacklist_mask=blacklist_mask)
+      elif sampling_mode == 'shs_safe':
+        samples = self._diffusion_sample_shs_safe(
+          classifier_model=classifier_model, cond=cond,
+          eps=eps, blacklist_mask=blacklist_mask)
+      else:  # 'default'
         samples = self._diffusion_sample(
           classifier_model=classifier_model, cond=cond,
-          eps=eps)
+          eps=eps, blacklist_mask=blacklist_mask)
     if not self.config.eval.disable_ema:
       self._restore_non_ema_params()
     return samples
@@ -1123,6 +1353,7 @@ class Diffusion(L.LightningModule):
     classifier_model: typing.Optional[classifier.Classifier] = None,
     cond: typing.Optional[torch.tensor] = None,
     eps: float = 1e-5,  # Note: differs from self.config.training.sampling_eps
+    blacklist_mask: typing.Optional[torch.Tensor] = None,
   ):
     """Generate samples using diffusion sampling.
 
@@ -1142,7 +1373,8 @@ class Diffusion(L.LightningModule):
     """
     xt = self._sample_prior(
       self.config.sampling.batch_size,
-      self.config.model.length
+      self.config.model.length,
+      blacklist_mask=blacklist_mask
     ).to(self.device)
 
     timesteps = torch.linspace(
@@ -1236,6 +1468,12 @@ class Diffusion(L.LightningModule):
         else:
           raise NotImplementedError(
             f"Diffusion type {self.diffusion} not implemented.")
+
+        # Apply blacklist masking: zero out blacklisted tokens, scale safe tokens
+        # Use preserve_stay=True to maintain original hazard accumulation rate
+        if blacklist_mask is not None:
+          q_xs = _apply_blacklist_to_probs(q_xs, blacklist_mask,
+                                            current_tokens=xt, preserve_stay=True)
 
         # --- SHS: hazard accumulation and stratified event triggering ---
         # p_stay = q_xs(current token), p_jump = 1 - p_stay
@@ -1353,17 +1591,281 @@ class Diffusion(L.LightningModule):
 
     return xt
 
-  
+  @torch.no_grad()
+  def _diffusion_sample_shs_safe(
+    self,
+    classifier_model: typing.Optional[classifier.Classifier] = None,
+    cond: typing.Optional[torch.tensor] = None,
+    eps: float = 1e-5,
+    blacklist_mask: typing.Optional[torch.Tensor] = None,
+  ):
+    """SHS-Safe: Stratified Hazard Sampling with blacklist-aware lambda allocation.
+
+    Key difference from standard SHS:
+    - Lambdas (jump thresholds) are not assigned randomly per-position upfront
+    - Instead, lambdas are pre-sampled and sorted in ascending order
+    - At each step, lambdas are assigned to tokens based on p(V_black)/p(V):
+      tokens with higher blacklist probability get smaller lambdas (jump sooner)
+    - Lambda assignment is deferred: only assign up to the last token that
+      would jump in this iteration, rest are deferred to future iterations
+
+    This encourages "dangerous" tokens (high blacklist affinity) to jump first,
+    giving them more opportunities to transition away from blacklisted states.
+    """
+    if blacklist_mask is None:
+      # Without blacklist, fall back to standard SHS
+      return self._diffusion_sample_shs(
+        classifier_model=classifier_model, cond=cond, eps=eps)
+
+    batch_size = self.config.sampling.batch_size
+    seq_len = self.config.model.length
+
+    xt = self._sample_prior(
+      batch_size, seq_len, blacklist_mask=blacklist_mask
+    ).to(self.device)
+
+    timesteps = torch.linspace(
+      1, eps, self.config.sampling.steps + 1, device=self.device)
+    dt = (1 - eps) / self.config.sampling.steps
+
+    pbar = tqdm(range(self.config.sampling.steps),
+                desc='SHS-Safe Sampling',
+                leave=False)
+
+    NFEs = 0
+    cache: typing.Optional[typing.Dict[str, torch.Tensor]] = None
+
+    hazard_dtype = torch.float64 if self.config.sampling.use_float64 else torch.float32
+    blacklist_mask = blacklist_mask.to(self.device)
+
+    # --- SHS-Safe state initialization ---
+    # Pre-sample all lambdas (thresholds) for each batch and sort ascending
+    # Shape: (batch_size, seq_len)
+    all_lambdas = torch.rand(batch_size, seq_len, device=self.device, dtype=hazard_dtype)
+    all_lambdas_sorted, _ = torch.sort(all_lambdas, dim=-1)  # ascending order
+
+    # Track which positions have been assigned a lambda
+    # -1 means unassigned, otherwise stores the assigned lambda value
+    assigned_lambda = torch.full((batch_size, seq_len), -1.0,
+                                  device=self.device, dtype=hazard_dtype)
+    # Index into all_lambdas_sorted for next available lambda per batch
+    next_lambda_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+    # Cumulative hazard S and jump counter k (only for assigned positions)
+    S = torch.zeros(batch_size, seq_len, device=self.device, dtype=hazard_dtype)
+    k = torch.zeros(batch_size, seq_len, dtype=torch.long, device=self.device)
+
+    for i in pbar:
+      t = timesteps[i]
+      if self.T > 0:
+        t = (t * self.T).to(torch.int)
+        t = t / self.T
+        t += (1 / self.T)
+
+      t = t * torch.ones(xt.shape[0], 1, device=self.device)
+
+      sigma_t, _ = self.noise(t)
+      sigma_s, _ = self.noise(t - dt)
+
+      if sigma_t.ndim > 1:
+        sigma_t = sigma_t.squeeze(-1)
+      if sigma_s.ndim > 1:
+        sigma_s = sigma_s.squeeze(-1)
+
+      move_chance_t = 1 - torch.exp(-sigma_t)
+      move_chance_s = 1 - torch.exp(-sigma_s)
+      move_chance_t = move_chance_t[:, None, None]
+      move_chance_s = move_chance_s[:, None, None]
+
+      # Compute model prediction
+      time_conditioning = self._process_sigma(sigma_t)
+      use_cache = bool(getattr(self.config.sampling, 'use_cache', False))
+      reuse_cache = (
+        use_cache and cache is not None
+        and ('log_x_theta' in cache)
+        and ('time_conditioning' in cache)
+        and torch.allclose(cache['time_conditioning'], time_conditioning)
+      )
+      if reuse_cache:
+        log_x_theta = cache['log_x_theta']
+      else:
+        NFEs += 1
+        log_x_theta = self.forward(xt, time_conditioning, cond=None)
+        if self.config.sampling.use_float64:
+          log_x_theta = log_x_theta.to(torch.float64)
+
+      x_theta = log_x_theta.exp()
+
+      # Compute posterior q(x_s | x_t)
+      if self.diffusion == 'absorbing_state':
+        q_xs = x_theta * (move_chance_t - move_chance_s)
+        q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+        q_xs = q_xs / move_chance_t
+      elif self.diffusion == 'uniform':
+        q_xs = self._compute_posterior(
+          x=x_theta,
+          xt=xt,
+          alpha_s=1 - move_chance_s,
+          alpha_t=1 - move_chance_t)
+      else:
+        raise NotImplementedError(
+          f"Diffusion type {self.diffusion} not implemented.")
+
+      # Apply blacklist masking to q_xs
+      # Use preserve_stay=True to maintain original hazard accumulation rate
+      q_xs = _apply_blacklist_to_probs(q_xs, blacklist_mask,
+                                        current_tokens=xt, preserve_stay=True)
+
+      # --- Compute p(V_black)/p(V) for each position ---
+      # p(V_black) = sum of probs for blacklisted tokens
+      p_black = (q_xs * blacklist_mask.float()).sum(dim=-1)  # (batch, seq_len)
+      # After blacklist masking, p(V) should be ~1.0 for safe tokens
+      # But let's compute it properly from the original (pre-masked) distribution
+      # Actually, after masking, sum should be 1. p_black is the "dangerous" mass
+      # We want to prioritize positions where original model wanted to go to blacklist
+      # So we compute from x_theta (model output before posterior)
+      p_black_model = (x_theta * blacklist_mask.float()).sum(dim=-1)  # (batch, seq_len)
+
+      # --- SHS-Safe Lambda Assignment ---
+      # For positions without assigned lambda, assign based on p(V_black)/p(V) ranking
+      unassigned_mask = (assigned_lambda < 0)  # (batch, seq_len)
+
+      xs = xt.clone()
+
+      # Process each batch item separately for lambda assignment
+      for b in range(batch_size):
+        unassigned_pos = unassigned_mask[b].nonzero(as_tuple=False).squeeze(-1)
+        if unassigned_pos.numel() == 0:
+          continue
+
+        # Get p_black for unassigned positions
+        p_black_unassigned = p_black_model[b, unassigned_pos]
+
+        # Sort by p_black descending (higher = more dangerous = smaller lambda)
+        sorted_indices = torch.argsort(p_black_unassigned, descending=True)
+        sorted_pos = unassigned_pos[sorted_indices]
+
+        # Determine how many lambdas to assign this iteration
+        # We assign lambdas and check which would cause a jump
+        # Only assign up to the last jumper
+
+        num_to_consider = sorted_pos.numel()
+        num_available = seq_len - next_lambda_idx[b].item()
+        num_to_consider = min(num_to_consider, num_available)
+
+        if num_to_consider == 0:
+          continue
+
+        # Tentatively assign lambdas
+        tentative_lambdas = all_lambdas_sorted[b, next_lambda_idx[b]:next_lambda_idx[b] + num_to_consider]
+        tentative_pos = sorted_pos[:num_to_consider]
+
+        # Compute p_jump for these positions
+        p_stay = torch.gather(q_xs[b], -1, xt[b, tentative_pos].unsqueeze(-1)).squeeze(-1)
+        p_jump_tentative = (1.0 - p_stay).clamp(0.0, 1.0)
+
+        # Compute cumulative hazard after this step
+        S_tentative = S[b, tentative_pos] + p_jump_tentative
+        k_tentative = k[b, tentative_pos]
+
+        # Threshold for jump: lambda + k
+        threshold_tentative = tentative_lambdas + k_tentative.to(hazard_dtype)
+
+        # Which positions would jump?
+        would_jump = (S_tentative >= threshold_tentative) & (p_jump_tentative > 0)
+
+        # Only assign lambdas if there are jumpers this iteration
+        # If no jumpers, S continues accumulating and will trigger assignments later
+        if would_jump.any():
+          jump_indices = would_jump.nonzero(as_tuple=False).squeeze(-1)
+          last_jumper_idx = jump_indices.max().item() + 1
+
+          # Only assign up to last_jumper_idx
+          num_to_assign = min(last_jumper_idx, num_to_consider)
+          assign_pos = tentative_pos[:num_to_assign]
+          assign_lambdas = tentative_lambdas[:num_to_assign]
+
+          # Actually assign
+          assigned_lambda[b, assign_pos] = assign_lambdas
+          next_lambda_idx[b] += num_to_assign
+      # --- Standard SHS logic with assigned lambdas ---
+      # p_stay and p_jump
+      p_stay = torch.gather(q_xs, -1, xt.unsqueeze(-1)).squeeze(-1)
+      p_jump = (1.0 - p_stay).clamp(0.0, 1.0)
+
+      if self.diffusion == 'absorbing_state':
+        copy_flag = (xt != self.mask_index)
+        p_jump = p_jump.masked_fill(copy_flag, 0.0)
+
+      # Accumulate S for ALL positions (not just assigned)
+      # This allows unassigned positions to build up hazard for future assignment
+      S = S + p_jump
+      assigned_mask_bool = (assigned_lambda >= 0)
+
+      # Compute threshold for assigned positions
+      threshold = torch.where(
+        assigned_mask_bool,
+        assigned_lambda + k.to(hazard_dtype),
+        torch.tensor(float('inf'), device=self.device, dtype=hazard_dtype)
+      )
+
+      # Jump decision
+      jump_mask = (S >= threshold) & (p_jump > 0) & assigned_mask_bool
+
+      if self.diffusion == 'absorbing_state':
+        jump_mask = jump_mask & (~copy_flag)
+
+      # Apply jumps
+      if jump_mask.any():
+        flat_jump = jump_mask.reshape(-1)
+        jump_idx = flat_jump.nonzero(as_tuple=False).squeeze(-1)
+
+        q_sel = q_xs.reshape(-1, q_xs.shape[-1]).index_select(0, jump_idx)
+        xt_sel = xt.reshape(-1).index_select(0, jump_idx)
+
+        # q(· | jump) with current token removed
+        q_sel = q_sel.clone()
+        q_sel.scatter_(1, xt_sel.unsqueeze(1), 0.0)
+        q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        new_sel = _sample_categorical(q_sel)
+
+        xs_flat = xs.reshape(-1)
+        xs_flat[jump_idx] = new_sel
+        xs = xs_flat.view_as(xs)
+
+        # Update k for jumped positions
+        k_flat = k.reshape(-1)
+        k_flat[jump_idx] += 1
+        k = k_flat.view_as(k)
+
+      pbar.set_postfix(
+        NFEs=NFEs,
+        assigned=assigned_mask_bool.float().mean().item(),
+        prob_check=(q_xs.sum() / xt.numel()).item())
+
+      if (not use_cache) or (not torch.equal(xs, xt)):
+        cache = None
+      else:
+        cache = {'log_x_theta': log_x_theta,
+                 'time_conditioning': time_conditioning}
+
+      xt = xs
+
+    return xt
+
   @torch.no_grad()
   def _diffusion_sample(
     self,
     classifier_model: typing.Optional[classifier.Classifier] = None,
     cond: typing.Optional[torch.tensor] = None,
     eps: float = 1e-5,  # Note: differs from self.config.training.sampling_eps
+    blacklist_mask: typing.Optional[torch.Tensor] = None,
   ):
     xt = self._sample_prior(
       self.config.sampling.batch_size,
-      self.config.model.length
+      self.config.model.length,
+      blacklist_mask=blacklist_mask
     ).to(self.device)
     timesteps = torch.linspace(
       1, eps, self.config.sampling.steps + 1, device=self.device)
@@ -1403,7 +1905,8 @@ class Diffusion(L.LightningModule):
           time_conditioning=sigma_t,
           move_chance_t=move_chance_t,
           move_chance_s=move_chance_s,
-          cache=cache)
+          cache=cache,
+          blacklist_mask=blacklist_mask)
       else:
         if self.config.guidance.method == 'cfg':
           xs, q_xs, cache = self._cfg_denoise(
@@ -1457,6 +1960,7 @@ class Diffusion(L.LightningModule):
     move_chance_t: torch.tensor,
     move_chance_s: torch.tensor,
     cache: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
+    blacklist_mask: typing.Optional[torch.Tensor] = None,
   ) -> typing.Tuple[torch.tensor, torch.tensor, typing.Dict[str, torch.tensor]]:
 
     # Compute x_theta
@@ -1483,6 +1987,12 @@ class Diffusion(L.LightningModule):
     else:
       raise NotImplementedError(
         f"Diffusion type {self.diffusion} not implemented.")
+
+    # Apply blacklist masking: zero out blacklisted tokens, scale safe tokens
+    # Use preserve_stay=True to avoid increasing p(stay), which causes "stickiness"
+    if blacklist_mask is not None:
+      q_xs = _apply_blacklist_to_probs(q_xs, blacklist_mask,
+                                        current_tokens=xt, preserve_stay=True)
 
     # Sample from posterior
     xs = _sample_categorical(q_xs)
