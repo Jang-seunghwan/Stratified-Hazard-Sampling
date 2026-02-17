@@ -1,12 +1,32 @@
-# Scaling Behavior of Discrete Diffusion Language Models
+# SHS Sampling for GIDD (Scaling Discrete Diffusion LMs)
+
+This repository extends [GIDD-EasyDeL](https://github.com/dvruette/gidd-easydel) with
+**Stratified Hazard Sampling (SHS)** as an additional inference-time sampling method.
+Training code is unchanged; SHS is available alongside the original `ancestral` and `adaptive`
+methods via `sampling_method="shs"`.
+
+## SHS Paper
+- Title: **Stratified Hazard Sampling: Minimal-Variance Event Scheduling for CTMC/DTMC Discrete Diffusion and Flow Models**
+- Authors: **Seunghwan Jang, SooJean Han**
+- arXiv: **https://arxiv.org/abs/2601.02799**
+
+## Sampling Modes
+
+| Mode | Description |
+|------|-------------|
+| `ancestral` | Standard ancestral sampling (original GIDD) |
+| `adaptive` | Score-based adaptive token selection |
+| `shs` | Stratified Hazard Sampling (variance reduction) |
+
+---
+
+## Original Paper
 
 Dimitri von Rütte, Janis Fluri, Antonio Orvieto, Omead Pooladzandi, Bernhard Schölkopf, Thomas Hofmann
 
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.10858-d22c2c.svg)](https://arxiv.org/abs/2512.10858)
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Scaling%20GIDD-f59a0c)](https://huggingface.co/collections/dvruette/scaling-behavior-of-discrete-diffusion-language-models)
-
----
 
 This repository contains the code to reproduce the experiments from the paper "Scaling Behavior of Discrete Diffusion Language Models".
 It includes implementations of the model architecture, training procedures, and evaluation code used in the study.
@@ -43,12 +63,13 @@ model.eval().to(device)
 prompt = "In a shocking finding, scientist discovered a herd of unicorns living in a remote, previously unexplored valley, in the Andes Mountains. Even more surprising to the researchers was the fact that the unicorns spoke perfect English."
 inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True).input_ids[:, :-1].to(device)
 
+# SHS sampling
 generated_ids = model.generate(
     inputs=inputs,
     max_length=128,
     block_length=128,
     steps=256,
-    sampling_method="adaptive",
+    sampling_method="shs",       # or "ancestral", "adaptive"
     temperature=0.0,
     show_progress=True,
 )
@@ -56,115 +77,102 @@ generated_ids = model.generate(
 print(tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0])
 ```
 
+## Gen-PPL Evaluation
 
-## Setup
-
-The training code is written primarily to be run on TPUs but can also be run on GPUs.
-To get started, clone the repository and install the required packages.
-It is recommended to use [`uv`](https://github.com/astral-sh/uv) with a virtual environment, as this is how the code was developed and tested.
+Two-phase workflow: (1) generate unconditional samples with GIDD, (2) measure PPL with a reference AR model.
 
 ```bash
-git clone https://github.com/dvruette/gidd-easydel
-cd gidd-easydel
-uv venv .venv --python 3.11
-source .venv/bin/activate
-uv pip install -r requirements.txt
-uv pip install -e .
+# All three sampling modes, NFE=128, 3 seeds, 1000 samples each
+python eval_gen_ppl.py
+
+# Quick test
+python eval_gen_ppl.py --num_samples 16 --nfes 64 --seeds 0
+
+# SHS only
+python eval_gen_ppl.py --modes shs --nfes 128 --seeds 0 1 2
+
+# Generation only (PPL measured later)
+python eval_gen_ppl.py --phase gen
+
+# PPL only (using previously generated samples)
+python eval_gen_ppl.py --phase ppl
 ```
 
-Make sure that the correct version of JAX is installed.
-The JAX version used during development is `0.7.1`.
-Depending on your hardware, use one of the following commands to install JAX with the appropriate backend:
-```bash
-# For TPU
-uv pip install -U jax[tpu]==0.7.1
-# For GPU
-uv pip install -U jax[cuda12]==0.7.1
+### Gen-PPL Parameters
 
-# Verify installation
-uv pip show jax
-# Should output `Version: 0.7.1`
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--modes` | `ancestral adaptive shs` | Sampling methods to evaluate |
+| `--nfes` | `128` | NFE (number of function evaluations / denoising steps) |
+| `--seeds` | `0 1 2` | Random seeds |
+| `--num_samples` | `1000` | Number of unconditional samples per mode |
+| `--ppl_model` | `Qwen/Qwen2.5-7B` | Reference AR model for PPL measurement |
+| `--phase` | `both` | `gen` / `ppl` / `both` |
+| `--temperature` | `1.0` | Sampling temperature |
+| `--model_name` | `dvruette/gidd-unif-3b` | GIDD model to evaluate |
 
-The codebase also depends on a number of custom forks.
-Depending on which tasks you would like to run (training or evaluation), please make sure to install the modified versions of the following packages:
-- dvruette/EasyDeL (for training): https://github.com/dvruette/EasyDeL
-- dvruette/eformer (for training): https://github.com/dvruette/eformer
-- dvruette/orbax (for checkpointing on TPU + HNS storage): https://github.com/dvruette/orbax/tree/fix-glob-step-path-on-hns
-- dvruette/lm-evaluation-harness (for evaluation): https://github.com/dvruette/lm-evaluation-harness/tree/gidd-v2
+## GSM8K Evaluation
 
-## Training
-
-#### Data
-The exact data split that was used for training, already pre-tokenized and pre-shuffled, is available here: https://huggingface.co/datasets/dvruette/gidd-nemotron-cc-pretok
-
-Make sure to download this data to your local storage/your GCS bucket and pass the path containing the dataset via the `DATA_FILES` environment variable.
-
-#### GPU
-For running the training code on GPU, you can use the `main_gpu.py` script.
-An example command to launch a training run on GPU is as follows:
+Few-shot math reasoning benchmark evaluation.
 
 ```bash
-# recommended for local runs only: skip safety check for whether data/checkpoint buckets are in the same region as the TPU
-export SKIP_GS_LOCATION_CHECK=1
-# configure data and checkpoint paths
-export DATA_FILES=/local/path/to/data/files/
-export SAVE_DIRECTORY=/local/path/to/checkpoints/
-# start a training run
-python main_gpu.py --batch_size 16 --lr 0.2 --num_layers 8 --hidden_size 512 --num_attn_heads 8 --max_seq_len 512 --hybrid_mixing_shift 1000.0
+# SHS sampling
+python eval_gsm8k.py --sampling_method shs --steps 256
+
+# Ancestral sampling (default)
+python eval_gsm8k.py --sampling_method ancestral --steps 256
+
+# Adaptive sampling with temperature
+python eval_gsm8k.py --sampling_method adaptive --temperature 0.7
+
+# Manual batch size
+python eval_gsm8k.py --sampling_method shs --batch_size 4
 ```
 
-#### TPU
-For running the training code on TPU, it is recommended to use [`ray`](https://ray.io/) as a coordinator.
-We will not go into details on how to set up a TPU cluster with `ray` here (see [here](https://docs.ray.io/en/latest/cluster/getting-started.html) for details), but the entrypoint for this case is the `main_ray.py` script.
-The scripts is configured through environment variables as described in the comments at the top of the file.
-An example command to launch a training run on a TPU cluster with `ray` is as follows (you can also set some of these environment variables in your ray cluster config):
+### GSM8K Parameters
 
-```bash
-ray job submit -- \
-    TPU_VERSION=v5p-8 \
-    TPU_POD_COUNT=1 \
-    TPU_ZONE=us-east5-a \
-    SAVE_DIRECTORY=gs://your-checkpointing-bucket/your-path/ \
-    DATA_FILES=gs://your-data-bucket/your-path/ \
-    WANDB_API_KEY_FOR_EASYDEL=your-wandb-key \
-    HF_TOKEN_FOR_EASYDEL=your-huggingface-token \  # only needed for gated/private models/tokenizers
-    python main_ray.py --batch_size 16 --lr 0.2 --num_layers 8 --hidden_size 512 --num_attn_heads 8 --max_seq_len 512 --hybrid_mixing_shift 1000.0
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--sampling_method` | `ancestral` | `ancestral` / `adaptive` / `shs` |
+| `--steps` | `256` | Number of denoising steps per block |
+| `--temperature` | `1.0` | Sampling temperature (0.0 = greedy) |
+| `--n_shots` | `8` | Number of few-shot examples (0-8) |
+| `--batch_size` | auto | Batch size (auto-detected if not set) |
+| `--model_name` | `dvruette/gidd-unif-3b` | GIDD model to evaluate |
+
+## Code Structure (SHS additions)
+
+```
+gidd_easydel/model/modeling_gidd_hf.py
+├── _sample_shs()              # SHS sampling (PyTorch/HuggingFace)
+└── generate()                 # Updated: sampling_method="shs" option added
+
+gidd_easydel/sampling.py
+├── shs_sampling_step()        # SHS sampling (JAX, for training)
+└── generate()                 # Updated: SHS state init + sampling call
+
+eval_gen_ppl.py                # Gen-PPL evaluation (ancestral/adaptive/shs)
+eval_gsm8k.py                  # GSM8K benchmark evaluation
 ```
 
-## Evaluation
-
-To evaluate a trained model, you can use the custom fork of the `lm-evaluation-harness` package.
-The forked version includes a custom model for loading the Orbax checkpoints produced by the training script and performs inference directly in JAX.
-
-#### GPU
-On a (local) GPU machine, you can run the evaluation as follows:
-
-```bash
-lm_eval --model gidd --model_args checkpoint_dir="/local/path/to/orbax/checkpoint/",num_layers=8,hidden_size=512,num_attn_heads=8,hybrid_mixing_shift=1000.0,prior_distribution=uniform,num_denoising_steps=128 --tasks gsm8k --batch_size 8
-```
-
-Note that by default, this will run the model in FSDP across all visible devices. If you wish to limit the number of devices used, you can set the `CUDA_VISIBLE_DEVICES` environment variable accordingly.
-
-#### TPU
-On a TPU Ray cluster, you can use the `eval_ray.py` script to run the evaluation.
-An example command looks as follows:
-
-```bash
-ray job submit -- \
-    TPU_VERSION=v6e-8 \
-    TPU_POD_COUNT=1 \
-    python eval_ray.py \
-        --model gidd \
-        --model_args 'checkpoint_dir=gs://your-checkpointing-bucket/path/to/checkpoint/gidd/orbax/,num_layers=8,hidden_size=512,num_attn_heads=8,hybrid_mixing_shift=1000.0,prior_distribution=uniform,num_denoising_steps=128' \
-        --tasks gsm8k \
-        --batch_size 32
-```
+For training, setup, and original evaluation scripts, see the original repository: [https://github.com/dvruette/gidd-easydel](https://github.com/dvruette/gidd-easydel)
 
 ## Citation
-If you find this work useful in your research, please consider citing our paper:
+If you find this work useful in your research, please consider citing:
 
+```bibtex
+@misc{jang2026stratifiedhazardsamplingminimalvariance,
+  title         = {Stratified Hazard Sampling: Minimal-Variance Event Scheduling for CTMC/DTMC Discrete Diffusion and Flow Models},
+  author        = {Seunghwan Jang and SooJean Han},
+  year          = {2026},
+  eprint        = {2601.02799},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2601.02799},
+}
 ```
+
+```bibtex
 @article{von2025scaling,
   title={Scaling Behavior of Discrete Diffusion Language Models},
   author={von R{\"u}tte, Dimitri and Fluri, Janis and Pooladzandi, Omead and Sch{\"o}lkopf, Bernhard and Hofmann, Thomas and Orvieto, Antonio},
@@ -172,6 +180,10 @@ If you find this work useful in your research, please consider citing our paper:
   year={2025}
 }
 ```
+
+## Acknowledgements
+This code is adapted from:
+- **Scaling Behavior of Discrete Diffusion Language Models** [https://github.com/dvruette/gidd-easydel]
 
 ## License
 This repository is released under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
