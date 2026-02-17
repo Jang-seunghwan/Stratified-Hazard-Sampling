@@ -161,10 +161,115 @@ def adaptive_sampling_step(
     return next_input_ids * noise_mask + input_ids * (1 - noise_mask), logits, prob_delta, curr_prob, best_prob
 
 
+def shs_sampling_step(
+    module,
+    input_ids,
+    attn_mask,
+    noise_mask,
+    log_snr_t,
+    log_snr_s,
+    key,
+    hybrid_mixing_shift,
+    vocab_size,
+    mask_token_id,
+    shs_S,
+    shs_k,
+    shs_theta,
+    top_k=1,
+    temp=0.0,
+    logits=None,
+    partition_spec=None,
+):
+    """Stratified Hazard Sampling step for uniform diffusion.
+
+    Accumulates jump probability into S. When S crosses threshold (theta + k),
+    a jump is triggered: the current token is excluded from the posterior and
+    a new token is sampled from the renormalized distribution.
+    """
+    # Forward pass
+    if logits is None:
+        outputs = module(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+        )
+        logits = with_sharding_constraint(outputs.logits, partition_spec)
+        logits = logits.at[..., mask_token_id].set(-1e6)
+
+    # Compute posterior using raw softmax (no temperature)
+    x_hat = nn.softmax(logits.astype(jnp.float32))
+
+    alpha_t = safe_sigmoid(log_snr_t)
+    alpha_s = safe_sigmoid(log_snr_s)
+    beta_t, beta_s = 1 - alpha_t, 1 - alpha_s
+    alpha_t_s = alpha_t / alpha_s
+
+    pi_t = pi_lambda(log_snr_t, shift=hybrid_mixing_shift, mask_token_id=mask_token_id, vocab_size=vocab_size)
+    pi_s = pi_lambda(log_snr_s, shift=hybrid_mixing_shift, mask_token_id=mask_token_id, vocab_size=vocab_size)
+    beta_pi_t_s = beta_t * pi_t - alpha_t_s * beta_s * pi_s
+    beta_pi_t_s_at_z = jnp.take_along_axis(
+        beta_pi_t_s[None, None, :],
+        input_ids[..., None],
+        axis=-1,
+    )
+
+    q_t = alpha_t * x_hat + beta_t * pi_t[None, None, :]
+    q_t_at_zt = jnp.take_along_axis(q_t, input_ids[..., None], axis=-1)
+    q_s = alpha_s * x_hat + beta_s * pi_s[None, None, :]
+
+    z_vec = nn.one_hot(input_ids, vocab_size, dtype=x_hat.dtype)
+    q_t_s_at_zt = alpha_t_s * z_vec + beta_pi_t_s_at_z
+
+    q_st = q_s / q_t_at_zt * q_t_s_at_zt  # posterior (batch, seq_len, vocab)
+
+    # Identify MASK vs non-MASK
+    is_mask = (input_ids == mask_token_id)
+    noise_mask_bool = noise_mask.astype(jnp.bool_)
+
+    # [MASK] tokens: standard posterior sampling
+    key, key_mask = jax.random.split(key)
+    mask_samples = sample_categorical(key_mask, q_st)
+
+    # non-[MASK] tokens: SHS hazard accumulation
+    p_stay = jnp.take_along_axis(q_st, input_ids[..., None], axis=-1).squeeze(-1)
+    p_jump = jnp.clip(1.0 - p_stay, 0.0, 1.0)
+
+    active_non_mask = (~is_mask) & noise_mask_bool
+    p_jump_masked = jnp.where(active_non_mask, p_jump, 0.0)
+    shs_S = shs_S + p_jump_masked
+
+    # Check threshold: jump when S >= theta + k
+    threshold = shs_theta + shs_k.astype(jnp.float32)
+    jump_mask = (shs_S >= threshold) & (p_jump_masked > 0) & active_non_mask
+
+    # Sample new tokens for all positions (JIT-safe: no dynamic control flow)
+    # Remove current token from posterior and renormalize
+    batch_size, seq_len = input_ids.shape
+    batch_idx = jnp.arange(batch_size)[:, None]
+    seq_idx = jnp.arange(seq_len)[None, :]
+    q_jump = q_st.at[batch_idx, seq_idx, input_ids].set(0.0)
+    q_jump = q_jump / jnp.clip(q_jump.sum(axis=-1, keepdims=True), 1e-12)
+
+    key, key_shs = jax.random.split(key)
+    shs_new_tokens = sample_categorical(key_shs, q_jump)
+
+    # Apply jumps where threshold is crossed, else keep current token
+    shs_samples = jnp.where(jump_mask, shs_new_tokens, input_ids)
+    shs_k = shs_k + jump_mask.astype(jnp.int32)
+
+    # Combine: MASK uses standard sampling, non-MASK uses SHS
+    next_ids = jnp.where(is_mask, mask_samples, shs_samples)
+
+    # Apply noise_mask: only update noisy positions
+    next_input_ids = next_ids * noise_mask + input_ids * (1 - noise_mask)
+
+    return next_input_ids, logits, shs_S, shs_k, shs_theta
+
+
 ancestral_sampling_step_jit = jax.jit(ancestral_sampling_step, static_argnames=("vocab_size", "mask_token_id", "top_k", "temp", "partition_spec"))
 adaptive_sampling_step_jit = jax.jit(adaptive_sampling_step, static_argnames=("vocab_size", "mask_token_id", "top_k", "temp", "partition_spec"))
+shs_sampling_step_jit = jax.jit(shs_sampling_step, static_argnames=("vocab_size", "mask_token_id", "top_k", "temp", "partition_spec"))
 
-    
+
 def clean_up_spaces(text):
     text = re.sub(r" (?=[.,:'’?])", "", text)
     text = re.sub(r" (?=-[\w])", "", text)
@@ -187,7 +292,7 @@ def generate(
     max_completion_length=128,
     noise_schedule="cosine",
     seed=0,
-    sampler: Literal["ancestral", "adaptive"] = "adaptive",
+    sampler: Literal["ancestral", "adaptive", "shs"] = "adaptive",
     top_k=1,
     temperature=0.0,
     completion_only=True,
@@ -215,7 +320,8 @@ def generate(
         sampling_step = ancestral_sampling_step_jit
     elif sampler == "adaptive":
         sampling_step = adaptive_sampling_step_jit
-        # sampling_step = adaptive_sampling_step
+    elif sampler == "shs":
+        sampling_step = shs_sampling_step_jit
     else:
         raise ValueError(f"Unknown sampler: {sampler}")
 
@@ -259,26 +365,57 @@ def generate(
     for i in range(batch_size):
         noise_mask = noise_mask.at[i, prompt_lens[i] + max_completion_length :].set(False)
 
+    # SHS state initialization
+    if sampler == "shs":
+        key, key_theta = jax.random.split(key)
+        shs_S = jnp.zeros_like(input_ids, dtype=jnp.float32)
+        shs_k = jnp.zeros_like(input_ids, dtype=jnp.int32)
+        shs_theta = jax.random.uniform(key_theta, input_ids.shape, dtype=jnp.float32)
+
     use_cached_logits, logits = False, None
     with mesh:
         for i in tqdm.trange(num_denoising_steps, disable=not (jax.process_index() == 0 and show_progress)):
             key, key_i = jax.random.split(key)
-            output_ids, logits, pos_scores, curr_conf, best_conf = sampling_step(
-                module,
-                input_ids,
-                attn_mask,
-                noise_mask,
-                log_snrs[i],
-                log_snrs[i+1],
-                key_i,
-                hybrid_mixing_shift,
-                vocab_size,
-                tokenizer.mask_token_id,
-                partition_spec=logit_partition_spec,
-                top_k=top_k,
-                temp=temperature,
-                logits=logits if use_cached_logits else None,
-            )
+
+            if sampler == "shs":
+                output_ids, logits, shs_S, shs_k, shs_theta = sampling_step(
+                    module,
+                    input_ids,
+                    attn_mask,
+                    noise_mask,
+                    log_snrs[i],
+                    log_snrs[i+1],
+                    key_i,
+                    hybrid_mixing_shift,
+                    vocab_size,
+                    tokenizer.mask_token_id,
+                    shs_S,
+                    shs_k,
+                    shs_theta,
+                    partition_spec=logit_partition_spec,
+                    top_k=top_k,
+                    temp=temperature,
+                    logits=logits if use_cached_logits else None,
+                )
+                pos_scores = curr_conf = best_conf = None
+            else:
+                output_ids, logits, pos_scores, curr_conf, best_conf = sampling_step(
+                    module,
+                    input_ids,
+                    attn_mask,
+                    noise_mask,
+                    log_snrs[i],
+                    log_snrs[i+1],
+                    key_i,
+                    hybrid_mixing_shift,
+                    vocab_size,
+                    tokenizer.mask_token_id,
+                    partition_spec=logit_partition_spec,
+                    top_k=top_k,
+                    temp=temperature,
+                    logits=logits if use_cached_logits else None,
+                )
+
             if step_callback is not None:
                 step_callback(
                     step=i,
