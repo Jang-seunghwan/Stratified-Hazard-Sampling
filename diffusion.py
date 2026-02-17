@@ -1488,7 +1488,6 @@ class Diffusion(L.LightningModule):
         # Accumulate discretized cumulative hazard.
         # print(S.min(), S.max(), S.std(), S.mean())
         S = S + p_jump.to(S.dtype)
-
         # Trigger a jump when S crosses theta + k (unit-spaced strata).
         threshold = theta + k.to(theta.dtype)
         jump_mask = (S >= threshold) & (p_jump > 0)
@@ -1596,32 +1595,24 @@ class Diffusion(L.LightningModule):
     self,
     classifier_model: typing.Optional[classifier.Classifier] = None,
     cond: typing.Optional[torch.tensor] = None,
-    eps: float = 1e-5,
+    eps: float = 1e-5,  # Note: differs from self.config.training.sampling_eps
     blacklist_mask: typing.Optional[torch.Tensor] = None,
   ):
-    """SHS-Safe: Stratified Hazard Sampling with blacklist-aware lambda allocation.
+    """SHS-Safe: Stratified Hazard Sampling with blacklist-aware acceleration.
 
-    Key difference from standard SHS:
-    - Lambdas (jump thresholds) are not assigned randomly per-position upfront
-    - Instead, lambdas are pre-sampled and sorted in ascending order
-    - At each step, lambdas are assigned to tokens based on p(V_black)/p(V):
-      tokens with higher blacklist probability get smaller lambdas (jump sooner)
-    - Lambda assignment is deferred: only assign up to the last token that
-      would jump in this iteration, rest are deferred to future iterations
+    Key modification from standard SHS:
+    - q_black = sum of transition probabilities to blacklist tokens (excluding self)
+    - rho = q_black / p_jump (violation ratio)
+    - normalization = SUM(p_jump) / SUM(p_jump * (1 + rho))
+    - S accumulation: S += p_jump * (1 + rho) * normalization
 
-    This encourages "dangerous" tokens (high blacklist affinity) to jump first,
-    giving them more opportunities to transition away from blacklisted states.
+    This accelerates hazard accumulation for positions with high blacklist affinity,
+    causing them to jump sooner and have more opportunities to transition away.
     """
-    if blacklist_mask is None:
-      # Without blacklist, fall back to standard SHS
-      return self._diffusion_sample_shs(
-        classifier_model=classifier_model, cond=cond, eps=eps)
-
-    batch_size = self.config.sampling.batch_size
-    seq_len = self.config.model.length
-
     xt = self._sample_prior(
-      batch_size, seq_len, blacklist_mask=blacklist_mask
+      self.config.sampling.batch_size,
+      self.config.model.length,
+      blacklist_mask=blacklist_mask
     ).to(self.device)
 
     timesteps = torch.linspace(
@@ -1632,32 +1623,26 @@ class Diffusion(L.LightningModule):
                 desc='SHS-Safe Sampling',
                 leave=False)
 
+    # NOTE: NFEs accounting in this codebase is approximate (e.g., CFG can
+    # do 2 forward passes). We keep the existing convention.
     NFEs = 0
     cache: typing.Optional[typing.Dict[str, torch.Tensor]] = None
 
-    hazard_dtype = torch.float64 if self.config.sampling.use_float64 else torch.float32
-    blacklist_mask = blacklist_mask.to(self.device)
-
-    # --- SHS-Safe state initialization ---
-    # Pre-sample all lambdas (thresholds) for each batch and sort ascending
-    # Shape: (batch_size, seq_len)
-    all_lambdas = torch.rand(batch_size, seq_len, device=self.device, dtype=hazard_dtype)
-    all_lambdas_sorted, _ = torch.sort(all_lambdas, dim=-1)  # ascending order
-
-    # Track which positions have been assigned a lambda
-    # -1 means unassigned, otherwise stores the assigned lambda value
-    assigned_lambda = torch.full((batch_size, seq_len), -1.0,
-                                  device=self.device, dtype=hazard_dtype)
-    # Index into all_lambdas_sorted for next available lambda per batch
-    next_lambda_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-
-    # Cumulative hazard S and jump counter k (only for assigned positions)
-    S = torch.zeros(batch_size, seq_len, device=self.device, dtype=hazard_dtype)
-    k = torch.zeros(batch_size, seq_len, dtype=torch.long, device=self.device)
+    # --- SHS-Safe state (only used when guidance is None) ---
+    if getattr(self.config, 'guidance', None) is None:
+      hazard_dtype = torch.float64 if self.config.sampling.use_float64 else torch.float32
+      # Discretized cumulative hazard S_i and jump counter k_i.
+      S = torch.zeros_like(xt, dtype=hazard_dtype)
+      k = torch.zeros_like(xt, dtype=torch.long)
+      # Random phase theta_i ~ U(0, 1).
+      theta = torch.rand(xt.shape, device=xt.device, dtype=hazard_dtype)
+      # Move blacklist_mask to device once
+      if blacklist_mask is not None:
+        blacklist_mask = blacklist_mask.to(self.device)
 
     for i in pbar:
       t = timesteps[i]
-      if self.T > 0:
+      if self.T > 0:  # t in {1/T,..., 1}, to match training
         t = (t * self.T).to(torch.int)
         t = t / self.T
         t += (1 / self.T)
@@ -1672,184 +1657,214 @@ class Diffusion(L.LightningModule):
       if sigma_s.ndim > 1:
         sigma_s = sigma_s.squeeze(-1)
 
+      assert sigma_t.ndim == 1, sigma_t.shape
+      assert sigma_s.ndim == 1, sigma_s.shape
+
+      # `move_chance_*` defines the (discrete) reverse transition kernel.
       move_chance_t = 1 - torch.exp(-sigma_t)
       move_chance_s = 1 - torch.exp(-sigma_s)
       move_chance_t = move_chance_t[:, None, None]
       move_chance_s = move_chance_s[:, None, None]
+      assert move_chance_t.ndim == 3, move_chance_t.shape
 
-      # Compute model prediction
-      time_conditioning = self._process_sigma(sigma_t)
-      use_cache = bool(getattr(self.config.sampling, 'use_cache', False))
-      reuse_cache = (
-        use_cache and cache is not None
-        and ('log_x_theta' in cache)
-        and ('time_conditioning' in cache)
-        and torch.allclose(cache['time_conditioning'], time_conditioning)
-      )
-      if reuse_cache:
-        log_x_theta = cache['log_x_theta']
-      else:
+      if getattr(self.config, 'guidance', None) is None:
+        # ==============================
+        #   Unconditional SHS-Safe path
+        # ==============================
+
+        # Use processed sigma for the *model* input (important when
+        # `time_conditioning=False`, where the model ignores sigma and can
+        # be safely cached across time).
+        time_conditioning = self._process_sigma(sigma_t)
+
+        # Compute log_x_theta (optionally cached).
+        use_cache = bool(getattr(self.config.sampling, 'use_cache', False))
+        reuse_cache = (
+          use_cache and cache is not None
+          and ('log_x_theta' in cache)
+          and ('time_conditioning' in cache)
+          and torch.allclose(cache['time_conditioning'], time_conditioning)
+        )
+        if reuse_cache:
+          log_x_theta = cache['log_x_theta']
+        else:
+          NFEs += 1
+          log_x_theta = self.forward(xt, time_conditioning, cond=None)
+          if self.config.sampling.use_float64:
+            log_x_theta = log_x_theta.to(torch.float64)
+
+        x_theta = log_x_theta.exp()
+
+        # Compute the usual per-step posterior q(x_s | x_t).
+        if self.diffusion == 'absorbing_state':
+          q_xs = x_theta * (move_chance_t - move_chance_s)
+          q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
+          q_xs = q_xs / move_chance_t
+        elif self.diffusion == 'uniform':
+          q_xs = self._compute_posterior(
+            x=x_theta,
+            xt=xt,
+            alpha_s=1 - move_chance_s,
+            alpha_t=1 - move_chance_t)
+        else:
+          raise NotImplementedError(
+            f"Diffusion type {self.diffusion} not implemented.")
+
+        # --- SHS-Safe: compute q_black BEFORE applying blacklist ---
+        # q_black = sum of transition probabilities to blacklist tokens (excluding self)
+        q_black = None
+        p_jump_orig = None
+        if blacklist_mask is not None:
+          # p_stay_orig and p_jump_orig: from original q_xs (before blacklist)
+          p_stay_orig = torch.gather(q_xs, -1, xt.unsqueeze(-1)).squeeze(-1)
+          p_jump_orig = (1.0 - p_stay_orig).clamp(0.0, 1.0)
+
+          # Sum of transition probs to blacklist tokens: q_xs * blacklist_mask
+          bm = blacklist_mask.view(1, 1, -1).float()  # (1, 1, vocab)
+          q_black = (q_xs * bm).sum(dim=-1)  # (batch, seq)
+
+          # Exclude self-transition if current token is in blacklist
+          current_in_black = blacklist_mask[xt]  # (batch, seq), bool
+          self_prob = p_stay_orig
+          q_black = q_black - self_prob * current_in_black.float()
+          q_black = q_black.clamp(min=0.0)
+
+        # Apply blacklist masking: zero out blacklisted tokens, scale safe tokens
+        if blacklist_mask is not None:
+          q_xs = _apply_blacklist_to_probs(q_xs, blacklist_mask,
+                                            current_tokens=xt, preserve_stay=True)
+
+        # --- SHS-Safe: hazard accumulation with blacklist-aware acceleration ---
+        # p_stay = q_xs(current token), p_jump = 1 - p_stay (from safe distribution)
+        p_stay = torch.gather(q_xs, -1, xt.unsqueeze(-1)).squeeze(-1)
+        p_jump = (1.0 - p_stay).clamp(0.0, 1.0)
+
+        # For absorbing-state diffusion, once a token is unmasked it must stay.
+        if self.diffusion == 'absorbing_state':
+          copy_flag = (xt != self.mask_index)
+          if p_jump_orig is not None:
+            p_jump_orig = p_jump_orig.masked_fill(copy_flag, 0.0)
+          p_jump = p_jump.masked_fill(copy_flag, 0.0)
+
+        # Accumulate discretized cumulative hazard with blacklist-aware acceleration.
+        if q_black is not None and p_jump_orig is not None:
+          # rho = q_black / p_jump_orig (violation ratio)
+          rho = q_black / (p_jump_orig + 1e-12)
+
+          # Weighted p_jump: positions with higher rho accumulate faster
+          weighted_p_jump = p_jump_orig * (1.0 + rho)
+
+          # Normalization: preserve total expected hazard accumulation per sequence
+          # norm = SUM_seq(p_jump_orig) / SUM_seq(p_jump_orig * (1 + rho))
+          # Shape: (batch, 1) - each sequence gets its own normalization constant
+          sum_p_jump = p_jump_orig.sum(dim=-1, keepdim=True)       # (batch, 1)
+          sum_weighted = weighted_p_jump.sum(dim=-1, keepdim=True) # (batch, 1)
+          normalization = sum_p_jump / (sum_weighted + 1e-12)      # (batch, 1)
+
+          # S update with acceleration
+          S = S + (weighted_p_jump * normalization).to(S.dtype)
+        else:
+          # Standard SHS without blacklist
+          S = S + p_jump.to(S.dtype)
+
+        # Trigger a jump when S crosses theta + k (unit-spaced strata).
+        threshold = theta + k.to(theta.dtype)
+        jump_mask = (S >= threshold) & (p_jump > 0)
+
+        if self.diffusion == 'absorbing_state':
+          jump_mask = jump_mask & (~copy_flag)
+
+        # Apply jumps (sample destination conditional on jumping).
+        xs = xt.clone()
+        if jump_mask.any():
+          flat_jump = jump_mask.reshape(-1)
+          jump_idx = flat_jump.nonzero(as_tuple=False).squeeze(-1)
+
+          q_sel = q_xs.reshape(-1, q_xs.shape[-1]).index_select(0, jump_idx)
+          xt_sel = xt.reshape(-1).index_select(0, jump_idx)
+
+          # q(· | jump) ∝ q_xs(·) with current token removed.
+          q_sel = q_sel.clone()
+          q_sel.scatter_(1, xt_sel.unsqueeze(1), 0.0)
+          q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+          new_sel = _sample_categorical(q_sel)
+
+          xs_flat = xs.reshape(-1)
+          xs_flat[jump_idx] = new_sel
+          xs = xs_flat.view_as(xs)
+
+          # Update k (jump counter) for jumped positions.
+          k_flat = k.reshape(-1)
+          k_flat[jump_idx] += 1
+          k = k_flat.view_as(k)
+
+        pbar.set_postfix(
+          NFEs=NFEs,
+          prob_check=(q_xs.sum() / xt.numel()).item(),
+          nan_check=bool(q_xs.isnan().sum() > 0))
+
+        # Keep cache only if xt did not change (same as original logic),
+        # but include time_conditioning to ensure correctness when sigma varies.
+        if (not use_cache) or (not torch.equal(xs, xt)):
+          cache = None
+        else:
+          cache = {'log_x_theta': log_x_theta,
+                   'time_conditioning': time_conditioning}
+
+        xt = xs
+        continue
+
+      # =========================
+      #   Guidance path (original)
+      # =========================
+      if cache is None:
         NFEs += 1
-        log_x_theta = self.forward(xt, time_conditioning, cond=None)
-        if self.config.sampling.use_float64:
-          log_x_theta = log_x_theta.to(torch.float64)
 
-      x_theta = log_x_theta.exp()
-
-      # Compute posterior q(x_s | x_t)
-      if self.diffusion == 'absorbing_state':
-        q_xs = x_theta * (move_chance_t - move_chance_s)
-        q_xs[:, :, self.mask_index] = move_chance_s[:, :, 0]
-        q_xs = q_xs / move_chance_t
-      elif self.diffusion == 'uniform':
-        q_xs = self._compute_posterior(
-          x=x_theta,
+      if self.config.guidance.method == 'cfg':
+        xs, q_xs, cache = self._cfg_denoise(
+          cond=cond,
+          gamma=self.config.guidance.gamma,
           xt=xt,
-          alpha_s=1 - move_chance_s,
-          alpha_t=1 - move_chance_t)
+          time_conditioning=sigma_t,
+          move_chance_t=move_chance_t,
+          move_chance_s=move_chance_s,
+          cache=cache)
+      elif self.config.guidance.method == 'cbg':
+        xs, q_xs, cache = self._cbg_denoise(
+          classifier_model=classifier_model,
+          conditioning_class=self.config.guidance.condition,
+          gamma=self.config.guidance.gamma,
+          use_approx=self.config.guidance.use_approx,
+          xt=xt,
+          time_conditioning=sigma_t,
+          move_chance_t=move_chance_t,
+          move_chance_s=move_chance_s,
+          cache=cache)
+      elif self.config.guidance.method == 'nos':
+        xs, q_xs, cache = self._nos_denoise(
+          classifier_model=classifier_model,
+          conditioning_class=self.config.guidance.condition,
+          num_nos_steps=self.config.guidance.num_nos_steps,
+          nos_step_size=self.config.guidance.nos_step_size,
+          nos_stability_coef=self.config.guidance.nos_stability_coef,
+          xt=xt,
+          time_conditioning=sigma_t,
+          move_chance_t=move_chance_t,
+          move_chance_s=move_chance_s)
       else:
         raise NotImplementedError(
-          f"Diffusion type {self.diffusion} not implemented.")
-
-      # Apply blacklist masking to q_xs
-      # Use preserve_stay=True to maintain original hazard accumulation rate
-      q_xs = _apply_blacklist_to_probs(q_xs, blacklist_mask,
-                                        current_tokens=xt, preserve_stay=True)
-
-      # --- Compute p(V_black)/p(V) for each position ---
-      # p(V_black) = sum of probs for blacklisted tokens
-      p_black = (q_xs * blacklist_mask.float()).sum(dim=-1)  # (batch, seq_len)
-      # After blacklist masking, p(V) should be ~1.0 for safe tokens
-      # But let's compute it properly from the original (pre-masked) distribution
-      # Actually, after masking, sum should be 1. p_black is the "dangerous" mass
-      # We want to prioritize positions where original model wanted to go to blacklist
-      # So we compute from x_theta (model output before posterior)
-      p_black_model = (x_theta * blacklist_mask.float()).sum(dim=-1)  # (batch, seq_len)
-
-      # --- SHS-Safe Lambda Assignment ---
-      # For positions without assigned lambda, assign based on p(V_black)/p(V) ranking
-      unassigned_mask = (assigned_lambda < 0)  # (batch, seq_len)
-
-      xs = xt.clone()
-
-      # Process each batch item separately for lambda assignment
-      for b in range(batch_size):
-        unassigned_pos = unassigned_mask[b].nonzero(as_tuple=False).squeeze(-1)
-        if unassigned_pos.numel() == 0:
-          continue
-
-        # Get p_black for unassigned positions
-        p_black_unassigned = p_black_model[b, unassigned_pos]
-
-        # Sort by p_black descending (higher = more dangerous = smaller lambda)
-        sorted_indices = torch.argsort(p_black_unassigned, descending=True)
-        sorted_pos = unassigned_pos[sorted_indices]
-
-        # Determine how many lambdas to assign this iteration
-        # We assign lambdas and check which would cause a jump
-        # Only assign up to the last jumper
-
-        num_to_consider = sorted_pos.numel()
-        num_available = seq_len - next_lambda_idx[b].item()
-        num_to_consider = min(num_to_consider, num_available)
-
-        if num_to_consider == 0:
-          continue
-
-        # Tentatively assign lambdas
-        tentative_lambdas = all_lambdas_sorted[b, next_lambda_idx[b]:next_lambda_idx[b] + num_to_consider]
-        tentative_pos = sorted_pos[:num_to_consider]
-
-        # Compute p_jump for these positions
-        p_stay = torch.gather(q_xs[b], -1, xt[b, tentative_pos].unsqueeze(-1)).squeeze(-1)
-        p_jump_tentative = (1.0 - p_stay).clamp(0.0, 1.0)
-
-        # Compute cumulative hazard after this step
-        S_tentative = S[b, tentative_pos] + p_jump_tentative
-        k_tentative = k[b, tentative_pos]
-
-        # Threshold for jump: lambda + k
-        threshold_tentative = tentative_lambdas + k_tentative.to(hazard_dtype)
-
-        # Which positions would jump?
-        would_jump = (S_tentative >= threshold_tentative) & (p_jump_tentative > 0)
-
-        # Only assign lambdas if there are jumpers this iteration
-        # If no jumpers, S continues accumulating and will trigger assignments later
-        if would_jump.any():
-          jump_indices = would_jump.nonzero(as_tuple=False).squeeze(-1)
-          last_jumper_idx = jump_indices.max().item() + 1
-
-          # Only assign up to last_jumper_idx
-          num_to_assign = min(last_jumper_idx, num_to_consider)
-          assign_pos = tentative_pos[:num_to_assign]
-          assign_lambdas = tentative_lambdas[:num_to_assign]
-
-          # Actually assign
-          assigned_lambda[b, assign_pos] = assign_lambdas
-          next_lambda_idx[b] += num_to_assign
-      # --- Standard SHS logic with assigned lambdas ---
-      # p_stay and p_jump
-      p_stay = torch.gather(q_xs, -1, xt.unsqueeze(-1)).squeeze(-1)
-      p_jump = (1.0 - p_stay).clamp(0.0, 1.0)
-
-      if self.diffusion == 'absorbing_state':
-        copy_flag = (xt != self.mask_index)
-        p_jump = p_jump.masked_fill(copy_flag, 0.0)
-
-      # Accumulate S for ALL positions (not just assigned)
-      # This allows unassigned positions to build up hazard for future assignment
-      S = S + p_jump
-      assigned_mask_bool = (assigned_lambda >= 0)
-
-      # Compute threshold for assigned positions
-      threshold = torch.where(
-        assigned_mask_bool,
-        assigned_lambda + k.to(hazard_dtype),
-        torch.tensor(float('inf'), device=self.device, dtype=hazard_dtype)
-      )
-
-      # Jump decision
-      jump_mask = (S >= threshold) & (p_jump > 0) & assigned_mask_bool
-
-      if self.diffusion == 'absorbing_state':
-        jump_mask = jump_mask & (~copy_flag)
-
-      # Apply jumps
-      if jump_mask.any():
-        flat_jump = jump_mask.reshape(-1)
-        jump_idx = flat_jump.nonzero(as_tuple=False).squeeze(-1)
-
-        q_sel = q_xs.reshape(-1, q_xs.shape[-1]).index_select(0, jump_idx)
-        xt_sel = xt.reshape(-1).index_select(0, jump_idx)
-
-        # q(· | jump) with current token removed
-        q_sel = q_sel.clone()
-        q_sel.scatter_(1, xt_sel.unsqueeze(1), 0.0)
-        q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-        new_sel = _sample_categorical(q_sel)
-
-        xs_flat = xs.reshape(-1)
-        xs_flat[jump_idx] = new_sel
-        xs = xs_flat.view_as(xs)
-
-        # Update k for jumped positions
-        k_flat = k.reshape(-1)
-        k_flat[jump_idx] += 1
-        k = k_flat.view_as(k)
+          f"Guidance method {self.config.guidance.method} not implemented.")
 
       pbar.set_postfix(
         NFEs=NFEs,
-        assigned=assigned_mask_bool.float().mean().item(),
-        prob_check=(q_xs.sum() / xt.numel()).item())
+        prob_check=(q_xs.sum() / xt.numel()).item(),
+        nan_check=bool(q_xs.isnan().sum() > 0))
 
-      if (not use_cache) or (not torch.equal(xs, xt)):
+      if (not self.config.sampling.use_cache or
+          not torch.allclose(xs, xt)):
+        # Disable caching
         cache = None
-      else:
-        cache = {'log_x_theta': log_x_theta,
-                 'time_conditioning': time_conditioning}
-
       xt = xs
 
     return xt
