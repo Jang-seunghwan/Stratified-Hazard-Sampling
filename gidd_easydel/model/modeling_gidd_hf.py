@@ -881,11 +881,14 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         q_t = alpha_t * x_hat + beta_t * pi_t[None, None, :]
         q_s = alpha_s * x_hat + beta_s * pi_s[None, None, :]
         q_t_at_z = q_t.gather(-1, z.unsqueeze(-1)).squeeze(-1)
+        q_t_at_z = q_t_at_z.clamp(min=1e-8)
 
         z_vec = torch.nn.functional.one_hot(z, num_classes=self.config.vocab_size).to(q_t.dtype)
         q_t_s_at_z = alpha_t_s * z_vec + beta_pi_t_s[z, None]
 
         p_s_t = q_s * q_t_s_at_z / q_t_at_z[..., None]
+        p_s_t = p_s_t.clamp(min=0.0)
+        p_s_t = p_s_t / p_s_t.sum(dim=-1, keepdim=True).clamp(min=1e-12)
 
         z_next = torch.multinomial(p_s_t.flatten(0, 1), num_samples=1).view_as(z)
         return z_next
@@ -923,7 +926,105 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         batch_indices = torch.arange(z.shape[0], device=z.device).unsqueeze(-1)
         z_next[batch_indices, next_poss] = next_tokens[batch_indices, next_poss]
         return z_next
-    
+
+    def _sample_shs(
+        self,
+        z_t: torch.Tensor,
+        logits: torch.Tensor,
+        log_snr_t: torch.Tensor,
+        log_snr_s: torch.Tensor,
+        mask_token_id: int,
+        shs_S: torch.Tensor,
+        shs_k: torch.Tensor,
+        shs_theta: torch.Tensor,
+        temperature: float = 1.0,
+        top_p: float | None = None,
+        top_k: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stratified Hazard Sampling step for uniform diffusion.
+
+        Instead of sampling each transition probabilistically, accumulates
+        jump probability into S. When S crosses threshold (theta + k),
+        a jump is triggered: the current token is excluded from the posterior
+        and a new token is sampled from the renormalized distribution.
+        """
+        hazard_dtype = torch.float64
+
+        x_hat = self._probs_with_topk_topp(
+            logits.to(torch.float32),
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+
+        alpha_s = log_snr_s.sigmoid()
+        alpha_t = log_snr_t.sigmoid()
+        beta_s, beta_t = 1.0 - alpha_s, 1.0 - alpha_t
+        alpha_t_s = alpha_t / alpha_s
+
+        pi_s = self._pi_lambda(log_snr_s, mask_token_id=mask_token_id)
+        pi_t = self._pi_lambda(log_snr_t, mask_token_id=mask_token_id)
+        beta_pi_t_s = beta_t * pi_t - alpha_t_s * beta_s * pi_s
+
+        q_t = alpha_t * x_hat + beta_t * pi_t[None, None, :]
+        q_s = alpha_s * x_hat + beta_s * pi_s[None, None, :]
+        q_t_at_z = q_t.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
+        q_t_at_z = q_t_at_z.clamp(min=1e-8)
+
+        z_vec = torch.nn.functional.one_hot(z_t, num_classes=self.config.vocab_size).to(q_t.dtype)
+        q_t_s_at_z = alpha_t_s * z_vec + beta_pi_t_s[z_t, None]
+
+        q_st = q_s * q_t_s_at_z / q_t_at_z[..., None]
+        q_st = q_st.clamp(min=0.0)
+        q_st = q_st / q_st.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+        # Identify mask vs non-mask tokens
+        is_mask = (z_t == mask_token_id)
+
+        # [MASK] tokens: standard probabilistic sampling from posterior
+        mask_samples = torch.multinomial(q_st.flatten(0, 1), num_samples=1).view_as(z_t)
+
+        # non-[MASK] tokens: SHS — accumulate hazard, jump when threshold crossed
+        p_stay = q_st.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
+        p_jump = (1.0 - p_stay).clamp(0.0, 1.0).to(hazard_dtype)
+
+        # Only accumulate hazard for non-MASK positions
+        p_jump_nm = p_jump.masked_fill(is_mask, 0.0)
+        shs_S = shs_S + p_jump_nm
+
+        # Trigger jump when cumulative hazard S crosses threshold (theta + k)
+        threshold = shs_theta + shs_k.to(hazard_dtype)
+        jump_mask = (shs_S >= threshold) & (p_jump_nm > 0) & (~is_mask)
+
+        shs_samples = z_t.clone()
+        if jump_mask.any():
+            flat_jump = jump_mask.reshape(-1)
+            jump_idx = flat_jump.nonzero(as_tuple=False).squeeze(-1)
+
+            q_sel = q_st.reshape(-1, q_st.shape[-1]).index_select(0, jump_idx).to(torch.float32)
+            zt_sel = z_t.reshape(-1).index_select(0, jump_idx)
+
+            # Remove current token from distribution and renormalize
+            q_sel = q_sel.clone()
+            q_sel.scatter_(1, zt_sel.unsqueeze(1), 0.0)
+            q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            new_tokens = torch.multinomial(q_sel, num_samples=1).squeeze(-1)
+
+            shs_flat = shs_samples.reshape(-1)
+            shs_flat[jump_idx] = new_tokens
+            shs_samples = shs_flat.view_as(shs_samples)
+
+            # Update jump counter
+            k_flat = shs_k.reshape(-1)
+            k_flat[jump_idx] += 1
+            shs_k = k_flat.view_as(shs_k)
+
+        # Combine: [MASK] uses standard sampling, non-[MASK] uses SHS
+        z_next = torch.where(is_mask, mask_samples, shs_samples)
+
+        return z_next, shs_S, shs_k
+
     @torch.no_grad()
     def generate(
         self,
@@ -939,7 +1040,7 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         eos_token_id: int = 1,
         pad_token_id: int = 2,
         mask_token_id: int = 3,
-        sampling_method: tp.Literal["ancestral", "adaptive"] = "ancestral",
+        sampling_method: tp.Literal["ancestral", "adaptive", "shs"] = "ancestral",
         noise_schedule: tp.Literal["linear", "cosine"] | tp.Callable[[torch.Tensor], torch.Tensor] = "cosine",
         tokens_per_step: int = 1,
         show_progress: bool = False,
@@ -978,10 +1079,13 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
             `torch.Tensor`: A string containing the generated token IDs, starting
             after the prompt and stopping at the first `eos_id` or `gen_length`.
         """
-        if sampling_method not in ["ancestral", "adaptive"]:
+        if sampling_method not in ["ancestral", "adaptive", "shs"]:
             raise ValueError(f"Unsupported sampling method: {sampling_method}")
         if noise_schedule not in ["linear", "cosine"] and not callable(noise_schedule):
             raise ValueError("noise_schedule must be 'linear', 'cosine', or a callable function.")
+
+        import math
+        tokens_per_step = max(1, math.ceil(block_length / steps))
 
         if inputs is None:
             inputs = torch.tensor([[bos_token_id]], device=self.device, dtype=torch.long)
@@ -1050,6 +1154,10 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
 
                 keep_logits = False
                 past_key_values = None
+                if sampling_method == "shs":
+                    shs_S = torch.zeros((batch_size, block_length), dtype=torch.float64, device=self.device)
+                    shs_k = torch.zeros((batch_size, block_length), dtype=torch.long, device=self.device)
+                    shs_theta = torch.rand((batch_size, block_length), dtype=torch.float64, device=self.device)
                 for step in range(steps, 0, -1):
                     if past_key_values is None:
                         output = self.forward(
@@ -1103,6 +1211,20 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
                             log_snr=log_snrs[step],
                             n_tokens=tokens_per_step,
                             mask_token_id=mask_token_id,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                        )
+                    elif sampling_method == "shs":
+                        z_s, shs_S, shs_k = self._sample_shs(
+                            z_t=z_t,
+                            logits=active_logits,
+                            log_snr_t=log_snrs[step],
+                            log_snr_s=log_snrs[step - 1],
+                            mask_token_id=mask_token_id,
+                            shs_S=shs_S,
+                            shs_k=shs_k,
+                            shs_theta=shs_theta,
                             temperature=temperature,
                             top_p=top_p,
                             top_k=top_k,
