@@ -4,7 +4,7 @@ import tqdm.auto as tqdm
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from gidd.diffusion_process import HybridDiffusion
-from gidd.sampling import GiddSampler
+from gidd.sampling import GiddSampler, GiddSamplerSHS
 from gidd.utils import sample_categorical
 
 
@@ -26,6 +26,7 @@ class GiddPipeline(nn.Module):
         self.config = config
 
         self.sampler = GiddSampler(model, tokenizer, noise_schedule, t_eps=config.t_eps, compile_step=compile_step)
+        self.sampler_shs = GiddSamplerSHS(model, tokenizer, noise_schedule, t_eps=config.t_eps, compile_step=False)
 
     @torch.compiler.disable
     def progress_bar(self, iterable=None, total=None):
@@ -50,10 +51,12 @@ class GiddPipeline(nn.Module):
         num_inference_steps: int = 128,
         show_progress: bool = True,
         dtype: torch.dtype = torch.bfloat16,
+        use_shs: bool = False,
     ) -> list[str]:
         device = next(self.model.parameters()).device
+        sampler = self.sampler_shs if use_shs else self.sampler
         with torch.autocast(device.type, dtype):
-            return self.sampler.generate(
+            return sampler.generate(
                 num_samples=num_samples,
                 num_denoising_steps=num_inference_steps,
                 max_length=self.config.max_seq_len,

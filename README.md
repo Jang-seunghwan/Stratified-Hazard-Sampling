@@ -1,4 +1,28 @@
-# Generalized Interpolating Discrete Diffusion
+# SHS Sampling for GIDD (Generalized Interpolating Discrete Diffusion)
+
+This repository extends [GIDD](https://github.com/dvruette/gidd) with
+**Stratified Hazard Sampling (SHS)** as an additional inference-time sampling method.
+Training code is unchanged; SHS is available alongside the original diffusion sampler
+via `use_shs=True` in `GiddPipeline.generate()`.
+
+## SHS Paper
+- Title: **Stratified Hazard Sampling: Minimal-Variance Event Scheduling for CTMC/DTMC Discrete Diffusion and Flow Models**
+- Authors: **Seunghwan Jang, SooJean Han**
+- arXiv: **https://arxiv.org/abs/2601.02799**
+
+## Sampling Modes
+
+| Mode | Description |
+|------|-------------|
+| `default` | Standard GIDD diffusion sampling |
+| `shs` | Stratified Hazard Sampling (variance reduction for non-[MASK] tokens) |
+
+SHS applies hazard-based jump events to non-[MASK] tokens while [MASK] tokens
+use standard probabilistic unmasking, unchanged from the original sampler.
+
+---
+
+## Original Paper
 
 By Dimitri von Rütte, Janis Fluri, Yuhui Ding, Antonio Orvieto, Bernhard Schölkopf, Thomas Hofmann
 
@@ -49,8 +73,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = GiddPipeline.from_pretrained("dvruette/gidd-base-p_unif-0.2", trust_remote_code=True)
 pipe.to(device)
 
-# Generate samples
-texts = pipe.generate(num_samples=4, num_inference_steps=128)
+# Generate samples with SHS
+texts = pipe.generate(num_samples=4, num_inference_steps=128, use_shs=True)
+
+# Generate samples with default sampler
+texts = pipe.generate(num_samples=4, num_inference_steps=128, use_shs=False)
 
 # Run self-correction step
 corrected_texts = pipe.self_correction(texts, num_inference_steps=128, early_stopping=True, temperature=0.1)
@@ -58,6 +85,53 @@ corrected_texts = pipe.self_correction(texts, num_inference_steps=128, early_sto
 print(corrected_texts)
 ```
 
+## Gen-PPL Evaluation
+
+Compare default vs SHS sampling with generative PPL measurement.
+
+```bash
+# SHS sampling
+python eval_gen_ppl.py --mode shs --seeds 0 1 2 --nfes 128
+
+# Default sampling
+python eval_gen_ppl.py --mode default --seeds 0 1 2 --nfes 128
+
+# Multiple NFE values
+python eval_gen_ppl.py --mode shs --seeds 0 1 2 --nfes 16 32 64 128 256
+
+# Skip self-correction / PPL
+python eval_gen_ppl.py --mode shs --no_self_correction --no_ppl
+```
+
+### Gen-PPL Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--mode` | `default` | `default` / `shs` |
+| `--seeds` | `0 1 2` | Random seeds |
+| `--nfes` | `128` | NFE (num denoising steps) values |
+| `--num_samples` | `64` | Number of samples per configuration |
+| `--batch_size` | `16` | Batch size for generation and PPL |
+| `--model` | `dvruette/gidd-base-p_unif-0.2` | HuggingFace model |
+| `--ppl_model` | `gpt2-large` | Reference LM for PPL measurement |
+| `--no_self_correction` | | Skip self-correction step |
+| `--no_ppl` | | Skip PPL computation |
+
+## Code Structure (SHS additions)
+
+```
+gidd/sampling.py
+├── GiddSamplerSHS              # SHS sampler class (non-[MASK]: hazard-based, [MASK]: standard)
+└── GiddSampler                 # Original diffusion sampler (unchanged)
+
+gidd/pipeline.py
+├── GiddPipeline.__init__()     # Creates both sampler and sampler_shs
+└── GiddPipeline.generate()     # use_shs=True selects SHS sampler
+
+eval_gen_ppl.py                         # Gen-PPL evaluation (default vs shs comparison)
+```
+
+---
 
 ## Reproducing Experiments
 
@@ -117,3 +191,30 @@ The `temp` argument controls the temperature used when resampling tokens from th
 ```bash
 python gidd/eval/self_correction.py path=./outputs/path/to/checkpoint/ samples_path=samples.pt corrected_samples_path=corrected_samples.pt batch_size=16 num_denoising_steps=128 temp=0.1
 ```
+
+## Citation
+
+```bibtex
+@misc{jang2026stratifiedhazardsamplingminimalvariance,
+  title         = {Stratified Hazard Sampling: Minimal-Variance Event Scheduling for CTMC/DTMC Discrete Diffusion and Flow Models},
+  author        = {Seunghwan Jang and SooJean Han},
+  year          = {2026},
+  eprint        = {2601.02799},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2601.02799},
+}
+```
+
+```bibtex
+@article{vonruette2025gidd,
+  title={Generalized Interpolating Discrete Diffusion},
+  author={von R{\"u}tte, Dimitri and Fluri, Janis and Ding, Yuhui and Orvieto, Antonio and Sch{\"o}lkopf, Bernhard and Hofmann, Thomas},
+  journal={arXiv preprint arXiv:2503.04482},
+  year={2025}
+}
+```
+
+## Acknowledgements
+This code is adapted from:
+- **Generalized Interpolating Discrete Diffusion** [https://github.com/dvruette/gidd]
