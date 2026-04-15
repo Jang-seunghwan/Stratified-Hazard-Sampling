@@ -178,7 +178,9 @@ def do_generation(
     logger,
     do_dynamic_step,
     grid,
+    solver_name: str = None,
 ):
+    _solver = solver_name if solver_name is not None else cfg.flow.student_solver
 
     samples, metrics = generate.generate_few_steps_samples_with_dataset(
         wrapped_model=WrappedModel(model=model),
@@ -193,7 +195,7 @@ def do_generation(
         sequence_length=cfg.model.length,
         sampling_steps=step,
         time_epsilon=time_epsilon,
-        student_solver=cfg.flow.student_solver,
+        student_solver=_solver,
         unmask_change=cfg.training.unmask_change,
         controlled_unmasking=controlled_unmasking,
         can_apply_dt=cfg.training.can_apply_dt,
@@ -259,11 +261,13 @@ def generate_samples_student_model(
     logger,
     do_dynamic_step,
     grid,
+    solver_name: str = None,
 ):
     samples = []
     controlled_unmasking = cfg.training.controlled_unmasking
     if controlled_unmasking and cfg.training.controlled_unmasking_type == "Training":
         controlled_unmasking = False
+    _solver = solver_name if solver_name is not None else cfg.flow.student_solver
     for _ in range(perplexity_n_samples // batch_size):
         samples.append(
             generate.generate_few_steps_samples(
@@ -280,7 +284,7 @@ def generate_samples_student_model(
                 sampling_steps=step,
                 time_epsilon=time_epsilon,
                 sample_dir=work_dirs.samples,
-                student_solver=cfg.flow.student_solver,
+                student_solver=_solver,
                 unmask_change=cfg.training.unmask_change,
                 controlled_unmasking=controlled_unmasking,
                 can_apply_dt=cfg.training.can_apply_dt,
@@ -329,6 +333,7 @@ def generate_samples_student_model(
         logger=logger,
         do_dynamic_step=do_dynamic_step,
         grid=grid,
+        solver_name=solver_name,
     )
 
     dist.barrier()
@@ -413,6 +418,7 @@ def calculate_perplexity(
                 logger=logger,
                 do_dynamic_step=do_dynamic_step,
                 grid=grid,
+                solver_name=solver_name,
             )
 
             if do_dynamic_step:
