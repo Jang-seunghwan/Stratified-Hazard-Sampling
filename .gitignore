@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Checkpoints & model weights
+checkpoints/
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Data cache
+cache_dir/
+
+# Results & logs
+results/
+outputs/
+*.log
+*.out
+
+# Hydra config (local)
+.hydra/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

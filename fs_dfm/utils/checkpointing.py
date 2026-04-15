@@ -40,8 +40,11 @@ def load_model_from_path(
     else:
         ckpt_dir = work_dir
 
-    loaded_state = torch.load(ckpt_dir, map_location=device, weights_only=True)
+    loaded_state = torch.load(ckpt_dir, map_location=device, weights_only=False)
 
+    # Support both checkpoint formats:
+    #   Apple release: {"model": state_dict, "optimizer": ..., "step": ...}
+    #   FS-DFM trained: {"teacher_model": state_dict, "student_model": state_dict, ...}
     if teacher_model:
         model = Transformer(
             config=cfg.model,
@@ -50,9 +53,13 @@ def load_model_from_path(
             dt_conditioned=False,
         ).to(device)
         model = DDP(model, device_ids=[device])
-        missing_keys, unexpected_keys = model.module.load_state_dict(
-            loaded_state["teacher_model"]
-        )
+        if "teacher_model" in loaded_state:
+            state_dict = loaded_state["teacher_model"]
+        elif "model" in loaded_state:
+            state_dict = loaded_state["model"]
+        else:
+            raise KeyError(f"Checkpoint has no 'teacher_model' or 'model' key. Keys: {list(loaded_state.keys())}")
+        missing_keys, unexpected_keys = model.module.load_state_dict(state_dict)
         print("teacher_model is loaded!!!")
     else:
         model = Transformer(
@@ -62,9 +69,13 @@ def load_model_from_path(
             dt_conditioned=True,
         ).to(device)
         model = DDP(model, device_ids=[device])
-        missing_keys, unexpected_keys = model.module.load_state_dict(
-            loaded_state["student_model"]
-        )
+        if "student_model" in loaded_state:
+            state_dict = loaded_state["student_model"]
+        elif "model" in loaded_state:
+            state_dict = loaded_state["model"]
+        else:
+            raise KeyError(f"Checkpoint has no 'student_model' or 'model' key. Keys: {list(loaded_state.keys())}")
+        missing_keys, unexpected_keys = model.module.load_state_dict(state_dict)
         print("student_model is loaded!!!")
 
     return model, missing_keys, unexpected_keys
