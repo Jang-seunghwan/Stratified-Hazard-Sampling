@@ -1,118 +1,78 @@
-# FS-DFM: FAST AND ACCURATE LONG TEXT GENERATION WITH FEW-STEP DIFFUSION LANGUAGE MODELS 
+# SHS on FS-DFM / DFM
 
-A PyTorch implementation of FS-DFM with custom solvers for efficient text generation and discrete sequence modeling. This software project accompanies the research paper, [FS-DFM: Fast and Accurate Long Text Generation with Few-Step Diffusion Language Models](https://arxiv.org/abs/2509.20624) .
+This repository applies **Stratified Hazard Sampling (SHS)** to the
+[FS-DFM](https://arxiv.org/abs/2509.20624) discrete flow matching codebase
+from Apple. Training code is unchanged; only the inference-time sampling rule
+is swapped to measure the effect of SHS on generation quality (Gen. PPL).
 
-## Overview
+## Paper
 
-This repository contains:
-- **Flow Matching** (`flow_matching/`): Based on [Flow Matching from Meta](https://github.com/facebookresearch/flow_matching) implementation, with our custom discrete solvers added in `discrete_solver_fsdfm.py`
-- **FS-DFM** (`fs_dfm/`): Fast sampling diffusion flow matching for discrete sequences
-- **Pre-training** (`pre_training/`): Transformer-based model pre-training utilities
+- **Stratified Hazard Sampling: Minimal-Variance Event Scheduling for
+  CTMC/DTMC Discrete Diffusion and Flow Models**
+- Authors: Seunghwan Jang, SooJean Han
+- arXiv: <https://arxiv.org/abs/2601.02799>
 
+## What This Branch Contains
 
-## Comparison of Methods
+| Component | Description |
+|-----------|-------------|
+| `flow_matching/solver/discrete_solver.py` | Original Meta flow-matching Euler solver |
+| `flow_matching/solver/discrete_solver_fsdfm.py` | FS-DFM solvers + **`MixtureDiscreteEulerSolverSHS`** |
+| `fs_dfm/` | FS-DFM evaluation & training code (Apple) |
+| `pre_training/` | DFM pre-training code (Apple) |
 
-| ARM | DFM | FS-DFM (Ours) |
-|-----|-----|---------------|
-| ![ARM](assets/gifs/arm.gif) | ![DFM](assets/gifs/dfm.gif) | ![FS-DFM](assets/gifs/fs_dfm.gif) |
+### SHS Integration
 
-
-
-## Key Features
-
-- Custom discrete flow matching solvers (`flow_matching/solver/discrete_solver_fsdfm.py`)
-- Student-teacher distillation framework
-- Multiple solver options: `mixture_euler`, `mixture_euler_with_cumulative_scalar`
-- Support for various source distributions (uniform, mask)
-- Efficient sampling with configurable steps
-
-## Installation
-
-### Prerequisites
-- Python 3.8+
-- CUDA 11.0+ (for GPU support)
-- conda or mamba package manager
-
-### Setup Environment
+SHS is implemented as a drop-in solver that replaces the standard
+Euler sampler's independent Bernoulli/Poisson jump decisions with
+stratified event scheduling in cumulative hazard space. The solver is
+selectable at evaluation time via `--use-shs`:
 
 ```bash
-# Create conda environment
+# Baseline (standard Euler)
+python fs_dfm/run_eval.py \
+    --work_dir results/baseline \
+    --ngpus 1 \
+    --perplexity_n_samples 320 \
+    --eval_perplexity \
+    --pre_trained_model_path DFM_checkpoint.pth \
+    --teacher_model
+
+# SHS
+python fs_dfm/run_eval.py \
+    --work_dir results/shs \
+    --ngpus 1 \
+    --perplexity_n_samples 320 \
+    --eval_perplexity \
+    --pre_trained_model_path DFM_checkpoint.pth \
+    --teacher_model \
+    --use-shs
+```
+
+### Solver Registry
+
+| Name | Class | Description |
+|------|-------|-------------|
+| `mixture_euler` | `MixtureDiscreteEulerSolver` | Standard Poisson-jump Euler (baseline) |
+| `mixture_euler_shs` | `MixtureDiscreteEulerSolverSHS` | **Stratified Hazard Sampling** |
+| `mixture_euler_with_cumulative_scalar` | `MixtureDiscreteEleurSolverWithCumulativeScalar` | Cumulative-scalar variant |
+
+## Setup
+
+```bash
 conda env create -f fsdfm_environment.yml
-
-# Activate environment
-conda activate FSDFM 
-
-# Install package in development mode
+conda activate FSDFM
 pip install -e .
 ```
 
 ## Checkpoints
 
-We provide pretrained checkpoints hosted on Apple’s ML Research. These can be used to (1) initialize training/fine-tuning and (2) run evaluation via `fs_dfm/run_eval.py` using `--pre_trained_model_path` (see example below).
+Pretrained checkpoints from Apple ML Research:
 
 | Model | Size | Source | Notes | URL |
-|---|---:|---|---|---|
-| FS-DFM | 1.3B | uniform | RK4 teacher distilled | [Download](https://ml-site.cdn-apple.com/models/fs-dfm/checkpoint_step_190000.pth)  |
+|-------|-----:|--------|-------|-----|
+| FS-DFM | 1.3B | uniform | RK4 teacher distilled | [Download](https://ml-site.cdn-apple.com/models/fs-dfm/checkpoint_step_190000.pth) |
 | DFM | 1.3B | uniform | DFM pretrained initialization | [Download](https://ml-site.cdn-apple.com/models/fs-dfm/checkpoint.pth) |
-
-
-
-
-## Usage
-
-### Training
-
-Train a model using the FS-DFM framework:
-
-```bash
-python fs_dfm/run_train.py \
-    data.cache_dir=${CACHE_DIR:-./cache_dir}
-```
-
-Configuration can be modified in `fs_dfm/configs/config.yaml`.
-
-### Evaluation
-
-Evaluate a trained model:
-
-```bash
-python fs_dfm/run_eval.py \
-    --work_dir "/path/to/output/artifacts" \
-    --ngpus 1 \
-    --perplexity_n_samples 320 \
-    --eval_elbo \
-    --eval_perplexity \
-    --pre_trained_model_path "/path/to/checkpoint.pth"
-```
-
-### Pre-training
-
-For pre-training transformer models:
-
-```bash
-python pre_training/run_train.py
-```
-
-## Configuration
-
-Key configuration parameters in `fs_dfm/configs/config.yaml`:
-
-- **Flow Settings**:
-  - `source_distribution`: Choose between `uniform` or `mask`
-  - `sampling_steps`: Number of sampling steps (default: 1024)
-  - `student_solver`: Solver type for student model
-  - `temperature`: Temperature for sampling (default: 1.0)
-
-- **Training Settings**:
-  - `optimizer`: AdamW optimizer with configurable learning rates
-  - `weight_decay`: 0.03
-  - `grad_clip`: 1.0
-  - `n_iters`: Total training iterations
-
-- **Evaluation Settings**:
-  - `batch_size`: Evaluation batch size
-  - `perplexity`: Enable perplexity evaluation
-  - `sample_batch_size`: Batch size for sampling
 
 ## Project Structure
 
@@ -120,58 +80,47 @@ Key configuration parameters in `fs_dfm/configs/config.yaml`:
 .
 ├── flow_matching/
 │   └── solver/
-│       └── discrete_solver_fsdfm.py    # Custom discrete flow solvers
+│       ├── discrete_solver.py            # Original Meta Euler solver
+│       └── discrete_solver_fsdfm.py      # FS-DFM solvers + SHS
 ├── fs_dfm/
-│   ├── configs/                      # Configuration files
-│   ├── eval.py                       # Evaluation utilities
-│   ├── logic/
-│   │   └── evaluate.py              # Likelihood estimation
-│   └── run_train.py                 # Training script
-└── pre_training/
-    ├── data/
-    │   └── data.py                   # Data loading utilities
-    ├── model/
-    │   └── transformer.py            # Transformer model components
-    └── run_train.py                  # Pre-training script
+│   ├── configs/config.yaml               # Hydra configuration
+│   ├── run_eval.py                       # Evaluation entry point (--use-shs)
+│   ├── eval.py                           # Evaluation orchestration
+│   └── logic/
+│       └── generate.py                   # Sample generation (solver selection)
+└── pre_training/                         # DFM pre-training utilities
 ```
 
-## Key Components
+## Acknowledgements
 
-### Discrete Solver (`flow_matching/solver/discrete_solver_fsdfm.py`)
-
-The `finite_probs_to_generator` method converts probability distributions to flow generators with:
-- Energy barrier for controlling transitions
-- Proper normalization with step size (`dt_seg`)
-- Safety clipping for numerical stability
-
-### Model Architecture
-
-The framework supports transformer-based architectures with:
-- Configurable vocabulary size
-- Dropout regularization
-- Distributed training support
+This code is adapted from:
+- **FS-DFM** (Apple): <https://github.com/apple/ml-fs-dfm>
+- **Flow Matching** (Meta): <https://github.com/facebookresearch/flow_matching>
 
 ## Citation
 
-If you use this code in your research, please cite:
-
 ```bibtex
+@misc{jang2026stratifiedhazardsamplingminimalvariance,
+  title         = {Stratified Hazard Sampling: Minimal-Variance Event Scheduling
+                   for CTMC/DTMC Discrete Diffusion and Flow Models},
+  author        = {Seunghwan Jang and SooJean Han},
+  year          = {2026},
+  eprint        = {2601.02799},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2601.02799},
+}
+
 @article{fsdfm2025,
-  title={FS-DFM: Fast and Accurate Long Text Generation with Few-Step Diffusion Language Models},
-  author={Amin Karimi Monsefi and Nikhil Bhendawade and Manuel Rafael Ciosici and Dominic Culver and Yizhe Zhang and Irina Belousova},
-  year={2025}
+  title   = {FS-DFM: Fast and Accurate Long Text Generation with
+             Few-Step Diffusion Language Models},
+  author  = {Amin Karimi Monsefi and Nikhil Bhendawade and
+             Manuel Rafael Ciosici and Dominic Culver and
+             Yizhe Zhang and Irina Belousova},
+  year    = {2025},
 }
 ```
 
-## Acknowledgments
-
-The flow matching implementation is based on [Flow Matching from Meta](https://github.com/facebookresearch/flow_matching), with custom discrete solvers added in `discrete_solver_fsdfm.py`.
-
 ## License
 
-See [LICENSE](./LICENSE) file for details.
-
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+See [LICENSE](./LICENSE) for the Apple license terms.
