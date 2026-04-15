@@ -483,8 +483,8 @@ class MixtureDiscreteEulerSolver(BaseJumperSolver):
         Fully vectorized _step to support controlled unmasking based on confidence scores.
         """
         eye = F.one_hot(x_t, num_classes=self.vocabulary_size).bool()
-        off_diag = u.masked_fill(eye, 0.0).clamp_min(1e-9)
-        λ = off_diag.sum(-1).clamp_min(1e-8)  # [B, L]
+        off_diag = u.masked_fill(eye, 0.0).clamp_min(0.0)
+        λ = off_diag.sum(-1).clamp_min(1e-12)  # [B, L]
 
         k = torch.poisson((λ * h.unsqueeze(-1)).clamp_max(50))
 
@@ -497,7 +497,7 @@ class MixtureDiscreteEulerSolver(BaseJumperSolver):
             mask = k > 0
 
         if mask.any():
-            probs = off_diag / λ.unsqueeze(-1)
+            probs = off_diag / λ.unsqueeze(-1).clamp_min(1e-12)
 
             if controlled_unmasking:
                 token_confidences, _ = probs.max(dim=-1)
@@ -721,9 +721,8 @@ class MixtureDiscreteEulerSolverSHS(MixtureDiscreteEulerSolver):
         x_next = x_t.clone()
         if jump_mask.any():
             # Normalize rates into destination probabilities.
-            u_for_sample = u.masked_fill(eye, 0.0).clamp_min(1e-9)
-            lam_norm = u_for_sample.sum(-1).clamp_min(1e-12)
-            probs = u_for_sample / lam_norm.unsqueeze(-1)  # [B, L, V]
+            u_for_sample = u.masked_fill(eye, 0.0).clamp_min(0.0)
+            probs = u_for_sample / u_for_sample.sum(-1, keepdim=True).clamp_min(1e-12)
 
             dest = torch.multinomial(probs[jump_mask].to(dtype), 1).squeeze(-1)
             x_next[jump_mask] = dest
