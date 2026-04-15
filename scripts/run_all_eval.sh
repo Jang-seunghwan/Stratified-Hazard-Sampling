@@ -28,7 +28,7 @@ SEED=42
 # 1) DFM + Standard (teacher model, baseline solver)
 # ============================================================
 echo "=== [1/4] DFM + Standard ==="
-conda run --no-banner -n ${CONDA_ENV} \
+conda run -n ${CONDA_ENV} --no-capture-output \
   python ${PROJ_DIR}/fs_dfm/run_eval.py \
     --work_dir "${RESULT_BASE}/dfm_standard" \
     --pre_trained_model_path "${DFM_CKPT}" \
@@ -44,7 +44,7 @@ conda run --no-banner -n ${CONDA_ENV} \
 # 2) DFM + SHS (teacher model, SHS solver)
 # ============================================================
 echo "=== [2/4] DFM + SHS ==="
-conda run --no-banner -n ${CONDA_ENV} \
+conda run -n ${CONDA_ENV} --no-capture-output \
   python ${PROJ_DIR}/fs_dfm/run_eval.py \
     --work_dir "${RESULT_BASE}/dfm_shs" \
     --pre_trained_model_path "${DFM_CKPT}" \
@@ -61,7 +61,7 @@ conda run --no-banner -n ${CONDA_ENV} \
 # 3) FS-DFM + Standard (student model, baseline solver)
 # ============================================================
 echo "=== [3/4] FS-DFM + Standard ==="
-conda run --no-banner -n ${CONDA_ENV} \
+conda run -n ${CONDA_ENV} --no-capture-output \
   python ${PROJ_DIR}/fs_dfm/run_eval.py \
     --work_dir "${RESULT_BASE}/fsdfm_standard" \
     --pre_trained_model_path "${FSDFM_CKPT}" \
@@ -76,7 +76,7 @@ conda run --no-banner -n ${CONDA_ENV} \
 # 4) FS-DFM + SHS (student model, SHS solver)
 # ============================================================
 echo "=== [4/4] FS-DFM + SHS ==="
-conda run --no-banner -n ${CONDA_ENV} \
+conda run -n ${CONDA_ENV} --no-capture-output \
   python ${PROJ_DIR}/fs_dfm/run_eval.py \
     --work_dir "${RESULT_BASE}/fsdfm_shs" \
     --pre_trained_model_path "${FSDFM_CKPT}" \

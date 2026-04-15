@@ -1,6 +1,7 @@
 from contextlib import nullcontext
 from math import ceil
 from typing import Callable, Optional, Union, Type
+import os
 
 import torch
 from torch import Tensor
@@ -18,6 +19,9 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
+# Number of sentences for detailed per-step diagnostics (p_ik heatmaps, snapshots)
+_DIAG_NUM_DETAILED = 8
+
 
 class BaseJumperSolver(Solver):
     def __init__(
@@ -32,6 +36,105 @@ class BaseJumperSolver(Solver):
             self.vocabulary_size = vocabulary_size + 1
         self.mask_token = mask_token
         self.source_distribution_p = source_distribution_p
+
+        # --- diagnostics state (populated when return_diagnostics=True) ---
+        self._diag_enabled: bool = False
+        self._diag_k: Optional[torch.Tensor] = None          # (B, L) jump counter
+        self._diag_S: Optional[torch.Tensor] = None          # (B, L) cumulative mass
+        self._diag_ever_jumped: Optional[torch.Tensor] = None # (B, L) bool
+        self._diag_step_jump_counts: list = []
+        self._diag_step_cumul_edit_ratio: list = []
+        self._diag_detailed_p_ik: list = []
+        self._diag_detailed_snapshots: list = []
+        # Directory to auto-save diagnostics (set externally before sample())
+        self.diagnostics_dir: Optional[str] = None
+        self.diagnostics_tag: str = ""  # e.g. "default" or "shs"
+
+    def _init_diagnostics(self, x_init: torch.Tensor) -> None:
+        """Initialize diagnostics accumulators before the sampling loop."""
+        B, L = x_init.shape
+        self._diag_k = torch.zeros((B, L), dtype=torch.long, device=x_init.device)
+        self._diag_S = torch.zeros((B, L), dtype=torch.float32, device=x_init.device)
+        self._diag_ever_jumped = torch.zeros((B, L), dtype=torch.bool, device=x_init.device)
+        self._diag_step_jump_counts = []
+        self._diag_step_cumul_edit_ratio = []
+        self._diag_detailed_p_ik = []
+        N = min(_DIAG_NUM_DETAILED, B)
+        self._diag_detailed_snapshots = [x_init[:N].cpu().clone()]
+
+    def _update_diagnostics(
+        self,
+        x_t: torch.Tensor,
+        x_next: torch.Tensor,
+        p_jump: torch.Tensor,  # (B, L)
+    ) -> None:
+        """Update diagnostics accumulators after one step. Called from _step()."""
+        if not self._diag_enabled:
+            return
+        with torch.no_grad():
+            jumped = (x_next != x_t)  # (B, L)
+            # If mask-based model, only count non-mask positions
+            if self.mask_token != -1:
+                not_mask = (x_t != self.mask_token)
+                jumped = jumped & not_mask
+                p_jump = p_jump.masked_fill(~not_mask, 0.0)
+
+            self._diag_S += p_jump
+            self._diag_k += jumped.long()
+            self._diag_ever_jumped |= jumped
+
+            self._diag_step_jump_counts.append(
+                jumped.sum(dim=-1).float().mean().item()
+            )
+            self._diag_step_cumul_edit_ratio.append(
+                self._diag_ever_jumped.float().mean().item()
+            )
+            N = min(_DIAG_NUM_DETAILED, x_next.shape[0])
+            self._diag_detailed_p_ik.append(p_jump[:N].cpu().float())
+            self._diag_detailed_snapshots.append(x_next[:N].cpu().clone())
+
+    def _finalize_diagnostics(
+        self,
+        x_final: torch.Tensor,
+        n_steps: int,
+        tokenizer=None,
+        seed: int = 0,
+    ) -> dict:
+        """Package diagnostics into a dict suitable for torch.save()."""
+        N = min(_DIAG_NUM_DETAILED, x_final.shape[0])
+        result = {
+            "sampling_mode": self.diagnostics_tag or "unknown",
+            "sampling_steps": n_steps,
+            "seed": seed,
+            "token_ids": x_final.cpu(),
+            "jump_counts": self._diag_k.cpu(),
+            "cumulative_mass": self._diag_S.cpu(),
+            "step_jump_counts": self._diag_step_jump_counts,
+            "step_cumul_edit_ratio": self._diag_step_cumul_edit_ratio,
+            "num_detailed": N,
+        }
+        if self._diag_detailed_p_ik:
+            result["detailed_p_ik"] = torch.stack(self._diag_detailed_p_ik, dim=1)  # (N, steps, L)
+        if self._diag_detailed_snapshots:
+            result["detailed_snapshots"] = torch.stack(self._diag_detailed_snapshots, dim=1)  # (N, steps+1, L)
+
+        # Decode samples if tokenizer provided
+        if tokenizer is not None:
+            try:
+                result["samples"] = tokenizer.batch_decode(x_final)
+            except Exception:
+                result["samples"] = []
+
+        # Auto-save if directory is set
+        if self.diagnostics_dir is not None:
+            os.makedirs(self.diagnostics_dir, exist_ok=True)
+            tag = self.diagnostics_tag or "unknown"
+            fname = f"diagnostics_{tag}_T{n_steps}_seed{seed}.pt"
+            save_path = os.path.join(self.diagnostics_dir, fname)
+            torch.save(result, save_path)
+            print(f"[Diagnostics] Saved: {save_path}")
+
+        return result
 
     def finite_probs_to_generator_differentiable(
         self,
@@ -146,8 +249,16 @@ class BaseJumperSolver(Solver):
         can_apply_dt: bool = True,
         controlled_unmasking=False,
         verbose=False,
+        return_diagnostics=False,
+        diagnostics_tokenizer=None,
+        diagnostics_seed: int = 0,
         **model_extras,
     ):
+
+        # Set up diagnostics if requested
+        self._diag_enabled = return_diagnostics
+        if return_diagnostics:
+            self._init_diagnostics(x_init)
 
         time_grid = time_grid.to(device=x_init.device)
 
@@ -203,11 +314,20 @@ class BaseJumperSolver(Solver):
                         )
 
                     x_1 = categorical(p_1t.to(dtype=dtype_categorical))
+                    x_prev = x_t.clone()
                     if self.mask_token != -1 and not unmask_change:
                         still_masked = x_t == self.mask_token  # boolean [B, L]
                         x_t[still_masked] = x_1[still_masked]  # overwrite only MASKs
                     else:
                         x_t = x_1
+
+                    # Diagnostics for final step: p_jump = 1.0 for all positions
+                    # (deterministic collapse)
+                    if self._diag_enabled:
+                        p_jump_final = torch.ones_like(self._diag_S)
+                        if self.mask_token != -1:
+                            p_jump_final.masked_fill_(x_prev != self.mask_token, 0.0)
+                        self._update_diagnostics(x_prev, x_t, p_jump_final)
                 else:
                     u = self.finite_probs_to_generator(
                         p_1t, x_t, h, t=t, can_apply_dt=can_apply_dt
@@ -232,11 +352,25 @@ class BaseJumperSolver(Solver):
                     ctx.set_description(f"NFE: {steps_counter}")
                 steps_counter += 1
 
-        return (
+        # Finalize diagnostics
+        diag_result = None
+        if self._diag_enabled:
+            diag_result = self._finalize_diagnostics(
+                x_t, n_steps,
+                tokenizer=diagnostics_tokenizer,
+                seed=diagnostics_seed,
+            )
+            self._diag_enabled = False
+
+        base_result = (
             torch.stack(res, dim=0)[order]
             if return_intermediates and step_size is not None
             else (torch.stack(res, dim=0) if return_intermediates else x_t)
         )
+
+        if return_diagnostics:
+            return base_result, diag_result
+        return base_result
 
     @torch.no_grad()
     def sample_masked(
@@ -463,6 +597,10 @@ class MixtureDiscreteEleurSolverWithCumulativeScalar(BaseJumperSolver):
             new_tokens = categorical(u_pos[mask_jump].to(dtype=dtype))
             x_t_new[mask_jump] = new_tokens
 
+        # --- Diagnostics ---
+        if self._diag_enabled:
+            self._update_diagnostics(x_t, x_t_new, jump_prob)
+
         return x_t_new
 
 
@@ -532,6 +670,13 @@ class MixtureDiscreteEulerSolver(BaseJumperSolver):
                 masked_probs = probs[mask].float()
                 dest = torch.multinomial(masked_probs.to(dtype), 1).squeeze(-1)
                 x_next[mask] = dest
+
+        # --- Diagnostics: compute p_jump from the rate u ---
+        if self._diag_enabled:
+            with torch.no_grad():
+                h_scalar = h.squeeze()
+                p_jump = (1.0 - torch.exp(-h_scalar * λ)).clamp(0.0, 1.0)  # [B, L]
+                self._update_diagnostics(x_t, x_next, p_jump)
 
         return x_next
 
@@ -727,6 +872,10 @@ class MixtureDiscreteEulerSolverSHS(MixtureDiscreteEulerSolver):
             dest = torch.multinomial(probs[jump_mask].to(dtype), 1).squeeze(-1)
             x_next[jump_mask] = dest
             self._shs_k[jump_mask] += 1
+
+        # --- Diagnostics: SHS already has p_jump computed above ---
+        if self._diag_enabled:
+            self._update_diagnostics(x_t, x_next, p_jump)
 
         return x_next
 

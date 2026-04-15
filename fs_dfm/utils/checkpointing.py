@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from logic.flow import SourceDistribution
 from model import Transformer
 from omegaconf import OmegaConf
@@ -45,6 +46,8 @@ def load_model_from_path(
     # Support both checkpoint formats:
     #   Apple release: {"model": state_dict, "optimizer": ..., "step": ...}
     #   FS-DFM trained: {"teacher_model": state_dict, "student_model": state_dict, ...}
+    use_ddp = dist.is_initialized() and dist.get_world_size() > 1
+
     if teacher_model:
         model = Transformer(
             config=cfg.model,
@@ -52,14 +55,15 @@ def load_model_from_path(
             masked=source_distribution.masked,
             dt_conditioned=False,
         ).to(device)
-        model = DDP(model, device_ids=[device])
         if "teacher_model" in loaded_state:
             state_dict = loaded_state["teacher_model"]
         elif "model" in loaded_state:
             state_dict = loaded_state["model"]
         else:
             raise KeyError(f"Checkpoint has no 'teacher_model' or 'model' key. Keys: {list(loaded_state.keys())}")
-        missing_keys, unexpected_keys = model.module.load_state_dict(state_dict)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        if use_ddp:
+            model = DDP(model, device_ids=[device])
         print("teacher_model is loaded!!!")
     else:
         model = Transformer(
@@ -68,14 +72,15 @@ def load_model_from_path(
             masked=source_distribution.masked,
             dt_conditioned=True,
         ).to(device)
-        model = DDP(model, device_ids=[device])
         if "student_model" in loaded_state:
             state_dict = loaded_state["student_model"]
         elif "model" in loaded_state:
             state_dict = loaded_state["model"]
         else:
             raise KeyError(f"Checkpoint has no 'student_model' or 'model' key. Keys: {list(loaded_state.keys())}")
-        missing_keys, unexpected_keys = model.module.load_state_dict(state_dict)
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        if use_ddp:
+            model = DDP(model, device_ids=[device])
         print("student_model is loaded!!!")
 
     return model, missing_keys, unexpected_keys

@@ -38,6 +38,8 @@ def generate_samples(
     x_init=None,
     file_name: str = "",
     solver_name: str = "mixture_euler",
+    diagnostics_dir: Optional[str] = None,
+    diagnostics_seed: int = 0,
 ) -> Tensor:
 
     add_token = 1 if source_distribution.masked else 0
@@ -47,18 +49,33 @@ def generate_samples(
         path=path,
         vocabulary_size=vocab_size + add_token,
     )
+
+    # Configure diagnostics if requested
+    return_diagnostics = diagnostics_dir is not None
+    if return_diagnostics:
+        solver.diagnostics_dir = diagnostics_dir
+        solver.diagnostics_tag = "shs" if "shs" in solver_name else "default"
+
     if x_init is None:
         x_init = source_distribution.sample(
             tensor_size=(sample_batch_size, sequence_length), device=device
         )
 
-    sample = solver.sample(
+    sample_result = solver.sample(
         x_init=x_init,
         step_size=1 / sampling_steps,
         verbose=False,
         dtype_categorical=dtype_categorical,
         time_grid=torch.tensor([0.0, 1.0 - time_epsilon]),
+        return_diagnostics=return_diagnostics,
+        diagnostics_tokenizer=tokenizer if return_diagnostics else None,
+        diagnostics_seed=diagnostics_seed,
     )
+
+    if return_diagnostics:
+        sample, _diag = sample_result
+    else:
+        sample = sample_result
 
     sentences = tokenizer.batch_decode(sample)
 
@@ -96,6 +113,8 @@ def generate_few_steps_samples(
     can_apply_dt=True,
     do_dynamic_step=False,
     grid=None,
+    diagnostics_dir: Optional[str] = None,
+    diagnostics_seed: int = 0,
 ) -> Tensor:
 
     solver_class = get_solver_by_name(student_solver)
@@ -107,6 +126,12 @@ def generate_few_steps_samples(
         # source_distribution_p=source_distribution,
         mask_token=mask_token,
     )
+
+    # Configure diagnostics if requested
+    return_diagnostics = diagnostics_dir is not None
+    if return_diagnostics:
+        solver.diagnostics_dir = diagnostics_dir
+        solver.diagnostics_tag = "shs" if "shs" in student_solver else "default"
 
     x_init = source_distribution.sample(
         tensor_size=(sample_batch_size, sequence_length), device=device
@@ -120,7 +145,7 @@ def generate_few_steps_samples(
         time_grid = grid
         # time_grid = grid.unsqueeze(0).expand(B, -1)
 
-    sample = solver.sample(
+    sample_result = solver.sample(
         x_init=x_init,
         step_size=step_size,
         verbose=False,
@@ -129,7 +154,15 @@ def generate_few_steps_samples(
         unmask_change=unmask_change,
         controlled_unmasking=controlled_unmasking,
         can_apply_dt=can_apply_dt,
+        return_diagnostics=return_diagnostics,
+        diagnostics_tokenizer=tokenizer if return_diagnostics else None,
+        diagnostics_seed=diagnostics_seed,
     )
+
+    if return_diagnostics:
+        sample, _diag = sample_result
+    else:
+        sample = sample_result
 
     sentences = tokenizer.batch_decode(sample)
 

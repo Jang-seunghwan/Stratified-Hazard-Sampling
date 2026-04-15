@@ -38,6 +38,9 @@ def generate_samples_teacher_model(
     time_epsilon,
     step,
     dataloader,
+    solver_name: str = "mixture_euler",
+    diagnostics_dir: str = None,
+    diagnostics_seed: int = 0,
 ):
     samples = []
     samples_left_500 = []
@@ -61,6 +64,8 @@ def generate_samples_teacher_model(
                 sampling_steps=step,  # 2 ** i
                 time_epsilon=time_epsilon,
                 solver_name=solver_name,
+                diagnostics_dir=diagnostics_dir if rank == 0 else None,
+                diagnostics_seed=diagnostics_seed,
             )
         )
 
@@ -262,6 +267,8 @@ def generate_samples_student_model(
     do_dynamic_step,
     grid,
     solver_name: str = None,
+    diagnostics_dir: str = None,
+    diagnostics_seed: int = 0,
 ):
     samples = []
     controlled_unmasking = cfg.training.controlled_unmasking
@@ -290,6 +297,8 @@ def generate_samples_student_model(
                 can_apply_dt=cfg.training.can_apply_dt,
                 do_dynamic_step=do_dynamic_step,
                 grid=grid,
+                diagnostics_dir=diagnostics_dir if rank == 0 else None,
+                diagnostics_seed=diagnostics_seed,
             )
         )
 
@@ -359,6 +368,8 @@ def calculate_perplexity(
     dataloader,
     do_dynamic_step,
     solver_name: str = "mixture_euler",
+    diagnostics_dir: str = None,
+    diagnostics_seed: int = 0,
 ):
     assert perplexity_n_samples // batch_size > 0
 
@@ -390,6 +401,9 @@ def calculate_perplexity(
                 time_epsilon,
                 step=2**i,
                 dataloader=dataloader,
+                solver_name=solver_name,
+                diagnostics_dir=diagnostics_dir,
+                diagnostics_seed=diagnostics_seed,
             )
         if not teacher_model:
             grid = None
@@ -419,6 +433,8 @@ def calculate_perplexity(
                 do_dynamic_step=do_dynamic_step,
                 grid=grid,
                 solver_name=solver_name,
+                diagnostics_dir=diagnostics_dir,
+                diagnostics_seed=diagnostics_seed,
             )
 
             if do_dynamic_step:
@@ -565,6 +581,12 @@ def run_eval(
     if rank == 0:
         print(f"[Eval] Solver: {solver_name}")
 
+    # Set up diagnostics directory
+    diagnostics_dir = os.path.join(work_dir, "diagnostics")
+    if rank == 0:
+        os.makedirs(diagnostics_dir, exist_ok=True)
+        print(f"[Eval] Diagnostics will be saved to: {diagnostics_dir}")
+
     if eval_perplexity:
         calculate_perplexity(
             perplexity_n_samples=perplexity_n_samples,
@@ -585,6 +607,8 @@ def run_eval(
             dataloader=dataloader,
             do_dynamic_step=do_dynamic_step,
             solver_name=solver_name,
+            diagnostics_dir=diagnostics_dir,
+            diagnostics_seed=seed,
         )
 
     if eval_elbo:
