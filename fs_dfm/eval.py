@@ -486,10 +486,7 @@ def run_eval(
     work_dirs.checkpoint = Path(pre_trained_model_path)
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
-    # cfg = checkpointing.load_cfg_from_path(work_dir=work_dirs.checkpoint)
-    cfg = checkpointing.load_cfg_from_path(
-        work_dir=os.path.join("/mnt/task_wrapper/user_output/cache_dir", "model")
-    )
+    cfg = checkpointing.load_cfg_from_path(work_dir=work_dirs.checkpoint)
     logger = logging.TrainLogger(log_dir=work_dirs.root, rank=rank, cfg=cfg)
     logger.info(work_dirs)
     logger.info(cfg)
