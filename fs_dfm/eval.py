@@ -493,6 +493,7 @@ def run_eval(
     teacher_model: bool = True,
     do_dynamic_step: bool = True,
     use_shs: bool = False,
+    use_dtmc: bool = False,
 ) -> None:
     torch.manual_seed(seed + rank)
 
@@ -577,7 +578,15 @@ def run_eval(
         shuffle=(data_state.sampler is None),
     )
 
-    solver_name = "mixture_euler_shs" if use_shs else "mixture_euler"
+    # 2x2 조합: {standard, shs} x {ctmc, dtmc}
+    if use_shs and use_dtmc:
+        solver_name = "mixture_euler_shs_dtmc"
+    elif use_shs:
+        solver_name = "mixture_euler_shs"
+    elif use_dtmc:
+        solver_name = "mixture_euler_dtmc"
+    else:
+        solver_name = "mixture_euler"
     if rank == 0:
         print(f"[Eval] Solver: {solver_name}")
 
@@ -639,7 +648,7 @@ def run_eval(
 
 def setup(rank: int, world_size: int, port: int) -> None:
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", str(port))
 
     torch.cuda.set_device(rank)
 
@@ -667,6 +676,7 @@ def run_mp_eval(
     teacher_model: bool = True,
     do_dynamic_step: bool = False,
     use_shs: bool = False,
+    use_dtmc: bool = False,
 ) -> None:
     try:
         setup(rank=rank, world_size=world_size, port=port)
@@ -685,6 +695,7 @@ def run_mp_eval(
             teacher_model=teacher_model,
             do_dynamic_step=do_dynamic_step,
             use_shs=use_shs,
+            use_dtmc=use_dtmc,
         )
     finally:
         cleanup()

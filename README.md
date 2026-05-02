@@ -25,37 +25,56 @@ is swapped to measure the effect of SHS on generation quality (Gen. PPL).
 
 SHS is implemented as a drop-in solver that replaces the standard
 Euler sampler's independent Bernoulli/Poisson jump decisions with
-stratified event scheduling in cumulative hazard space. The solver is
-selectable at evaluation time via `--use-shs`:
+stratified event scheduling in cumulative hazard space.
+
+### Three Independent Axes
+
+Experiments are controlled by three orthogonal choices:
+
+| Axis | Options | Flag |
+|------|---------|------|
+| **Model** | DFM (teacher) / FS-DFM (student) | `--teacher_model` (DFM) or omit (FS-DFM) |
+| **Probability** | CTMC / DTMC | `--dtmc` (DTMC) or omit (CTMC) |
+| **Sampling rule** | Standard / SHS | `--use-shs` (SHS) or omit (Standard) |
+
+**Probability mode** controls how per-step jump probability is computed:
+- **CTMC** (default): `p_jump = 1 - exp(-h * lambda)` — exact CTMC holding-time probability
+- **DTMC**: `p_jump = min(h * lambda, 1)` — tau-leap linear approximation (larger p_jump)
+
+**Sampling rule** controls how p_jump is used:
+- **Standard** (default): independent Bernoulli/Poisson per step
+- **SHS**: stratified cumulative hazard with single random phase per position
+
+### Usage Examples (2 x 2 x 2 = 8 combinations)
 
 ```bash
-# Baseline (standard Euler)
-python fs_dfm/run_eval.py \
-    --work_dir results/baseline \
-    --ngpus 1 \
-    --perplexity_n_samples 320 \
-    --eval_perplexity \
-    --pre_trained_model_path DFM_checkpoint.pth \
-    --teacher_model
+COMMON="--ngpus 1 --perplexity_n_samples 320 --eval_perplexity --sampling_steps 32"
 
-# SHS
-python fs_dfm/run_eval.py \
-    --work_dir results/shs \
-    --ngpus 1 \
-    --perplexity_n_samples 320 \
-    --eval_perplexity \
-    --pre_trained_model_path DFM_checkpoint.pth \
-    --teacher_model \
-    --use-shs
+# DFM + Standard + CTMC (baseline)
+python fs_dfm/run_eval.py $COMMON --teacher_model \
+    --pre_trained_model_path checkpoints/DFM_checkpoint.pth
+
+# DFM + SHS + DTMC
+python fs_dfm/run_eval.py $COMMON --teacher_model --use-shs --dtmc \
+    --pre_trained_model_path checkpoints/DFM_checkpoint.pth
+
+# FS-DFM + Standard + DTMC
+python fs_dfm/run_eval.py $COMMON --dtmc \
+    --pre_trained_model_path checkpoints/FSDFM_checkpoint.pth
+
+# FS-DFM + SHS + DTMC
+python fs_dfm/run_eval.py $COMMON --use-shs --dtmc \
+    --pre_trained_model_path checkpoints/FSDFM_checkpoint.pth
 ```
 
 ### Solver Registry
 
-| Name | Class | Description |
-|------|-------|-------------|
-| `mixture_euler` | `MixtureDiscreteEulerSolver` | Standard Poisson-jump Euler (baseline) |
-| `mixture_euler_shs` | `MixtureDiscreteEulerSolverSHS` | **Stratified Hazard Sampling** |
-| `mixture_euler_with_cumulative_scalar` | `MixtureDiscreteEleurSolverWithCumulativeScalar` | Cumulative-scalar variant |
+| Name | Sampling | Probability | Class |
+|------|----------|-------------|-------|
+| `mixture_euler` | Standard | CTMC | `MixtureDiscreteEulerSolver` |
+| `mixture_euler_dtmc` | Standard | DTMC | `MixtureDiscreteEulerSolver_DTMC` |
+| `mixture_euler_shs` | SHS | CTMC | `MixtureDiscreteEulerSolverSHS` |
+| `mixture_euler_shs_dtmc` | SHS | DTMC | `MixtureDiscreteEulerSolverSHS_DTMC` |
 
 ## Setup
 

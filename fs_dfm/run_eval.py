@@ -33,7 +33,8 @@ def main(args: argparse.Namespace):
             port=port,
             teacher_model=args.teacher_model,
             do_dynamic_step=args.do_dynamic_step,
-            use_shs=args.use_shs,
+            use_shs=args.use_shs or args.use_shs_dtmc,
+            use_dtmc=args.dtmc or args.use_shs_dtmc,
         )
     else:
         mp.set_start_method("forkserver")
@@ -54,7 +55,8 @@ def main(args: argparse.Namespace):
                 port,
                 args.teacher_model,
                 args.do_dynamic_step,
-                args.use_shs,
+                args.use_shs or args.use_shs_dtmc,
+                args.dtmc or args.use_shs_dtmc,
             ),
             nprocs=args.ngpus,
             join=True,
@@ -83,10 +85,19 @@ if __name__ == "__main__":
     # ELBO parameters
     parser.add_argument("--elbo_data", type=str, default="wikitext103")
 
-    # SHS (Stratified Hazard Sampling)
+    # Sampling rule
     parser.add_argument(
         "--use-shs", action="store_true",
-        help="Use Stratified Hazard Sampling (SHS) instead of standard Euler sampling."
+        help="Use SHS (stratified hazard) instead of standard Bernoulli/Poisson."
+    )
+    # Probability mode
+    parser.add_argument(
+        "--dtmc", action="store_true",
+        help="Use DTMC tau-leap p_jump=h*lambda instead of CTMC 1-exp(-h*lambda)."
+    )
+    # Backward compat
+    parser.add_argument("--use-shs-dtmc", action="store_true",
+        help="Shorthand for --use-shs --dtmc."
     )
 
     args = parser.parse_args()

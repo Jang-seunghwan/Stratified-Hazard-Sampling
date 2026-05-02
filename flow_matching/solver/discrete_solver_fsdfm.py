@@ -605,6 +605,17 @@ class MixtureDiscreteEleurSolverWithCumulativeScalar(BaseJumperSolver):
 
 
 class MixtureDiscreteEulerSolver(BaseJumperSolver):
+    """Standard Euler solver with Poisson/Bernoulli jump decisions.
+
+    Args:
+        p_jump_mode: How to compute jump probability from rate.
+            - "ctmc": P(jump) = 1-exp(-h*lambda), via Poisson(h*lambda) [default]
+            - "dtmc": P(jump) = min(h*lambda, 1), via Bernoulli(h*lambda)
+    """
+    def __init__(self, *args, p_jump_mode: str = "ctmc", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._p_jump_mode = p_jump_mode
+
     def _step(
         self,
         x_t,
@@ -624,15 +635,23 @@ class MixtureDiscreteEulerSolver(BaseJumperSolver):
         off_diag = u.masked_fill(eye, 0.0).clamp_min(0.0)
         λ = off_diag.sum(-1).clamp_min(1e-12)  # [B, L]
 
-        k = torch.poisson((λ * h.unsqueeze(-1)).clamp_max(50))
+        h_scalar = h.squeeze() if h.dim() > 0 else h
+        if self._p_jump_mode == "dtmc":
+            # DTMC tau-leap: Bernoulli(h*lambda)
+            p_jump_val = (h_scalar * λ).clamp(0.0, 1.0)
+            mask_jump = torch.rand_like(p_jump_val) < p_jump_val
+        else:
+            # CTMC: Poisson(h*lambda), jump if k > 0
+            k = torch.poisson((λ * h_scalar).clamp_max(50))
+            mask_jump = k > 0
 
         x_next = x_t.clone()
 
         if self.mask_token != -1 and not unmask_change:
             still_masked = x_t == self.mask_token
-            mask = (k > 0) & still_masked
+            mask = mask_jump & still_masked
         else:
-            mask = k > 0
+            mask = mask_jump
 
         if mask.any():
             probs = off_diag / λ.unsqueeze(-1).clamp_min(1e-12)
@@ -668,14 +687,22 @@ class MixtureDiscreteEulerSolver(BaseJumperSolver):
 
             else:
                 masked_probs = probs[mask].float()
+                # Guard against all-zero rows (can happen with DTMC mode)
+                row_sums = masked_probs.sum(-1)
+                bad = (row_sums <= 1e-12)
+                if bad.any():
+                    # Fill zero-sum rows with uniform to avoid multinomial crash
+                    masked_probs[bad] = 1.0 / self.vocabulary_size
                 dest = torch.multinomial(masked_probs.to(dtype), 1).squeeze(-1)
                 x_next[mask] = dest
 
         # --- Diagnostics: compute p_jump from the rate u ---
         if self._diag_enabled:
             with torch.no_grad():
-                h_scalar = h.squeeze()
-                p_jump = (1.0 - torch.exp(-h_scalar * λ)).clamp(0.0, 1.0)  # [B, L]
+                if self._p_jump_mode == "dtmc":
+                    p_jump = (h_scalar * λ).clamp(0.0, 1.0)
+                else:
+                    p_jump = (1.0 - torch.exp(-h_scalar * λ)).clamp(0.0, 1.0)
                 self._update_diagnostics(x_t, x_next, p_jump)
 
         return x_next
@@ -809,11 +836,18 @@ class MixtureDiscreteEulerSolverSHS(MixtureDiscreteEulerSolver):
         use_float64: Use float64 for the SHS accumulators S and theta (more
             precise cumulative hazard tracking, at the cost of memory).
             Defaults to False.
+        p_jump_mode: How to compute p_jump from the rate matrix u.
+            - "ctmc": p_jump = 1 - exp(-h * lambda)  [CTMC exact, default]
+            - "dtmc": p_jump = clamp(h * lambda, 0, 1)  [DTMC tau-leap / linear]
+            The "dtmc" mode gives larger p_jump (h*lambda vs 1-exp(-h*lambda)),
+            which can improve SHS on DFM where CTMC under-estimates jump mass.
     """
 
-    def __init__(self, *args, use_float64: bool = False, **kwargs):
+    def __init__(self, *args, use_float64: bool = False,
+                 p_jump_mode: str = "ctmc", **kwargs):
         super().__init__(*args, **kwargs)
         self._use_float64 = use_float64
+        self._p_jump_mode = p_jump_mode
         self._shs_S: Optional[torch.Tensor] = None
         self._shs_k: Optional[torch.Tensor] = None
         self._shs_theta: Optional[torch.Tensor] = None
@@ -847,9 +881,14 @@ class MixtureDiscreteEulerSolverSHS(MixtureDiscreteEulerSolver):
         u_pos = u.masked_fill(eye, 0.0).clamp_min(0.0)  # [B, L, V]
         lam = u_pos.sum(-1)  # [B, L] total outgoing rate
 
-        # Per-step jump probability: P(at least one jump in interval h).
+        # Per-step jump probability
         h_scalar = h.squeeze()  # scalar
-        p_jump = (1.0 - torch.exp(-h_scalar * lam)).clamp(0.0, 1.0)  # [B, L]
+        if self._p_jump_mode == "dtmc":
+            # DTMC tau-leap: p_jump = h * lambda, clamped to [0, 1]
+            p_jump = (h_scalar * lam).clamp(0.0, 1.0)  # [B, L]
+        else:
+            # CTMC exact: p_jump = 1 - exp(-h * lambda)
+            p_jump = (1.0 - torch.exp(-h_scalar * lam)).clamp(0.0, 1.0)  # [B, L]
 
         # For masked/absorbing models, freeze tokens that are already unmasked.
         if self.mask_token != -1 and not unmask_change:
@@ -890,9 +929,25 @@ class MixtureDiscreteEulerSolverSHS(MixtureDiscreteEulerSolver):
         return super().sample_masked(x_init, *args, **kwargs)
 
 
+class MixtureDiscreteEulerSolver_DTMC(MixtureDiscreteEulerSolver):
+    """Standard Euler solver with DTMC tau-leap p_jump = h*lambda."""
+    def __init__(self, *args, **kwargs):
+        kwargs["p_jump_mode"] = "dtmc"
+        super().__init__(*args, **kwargs)
+
+
+class MixtureDiscreteEulerSolverSHS_DTMC(MixtureDiscreteEulerSolverSHS):
+    """SHS with DTMC tau-leap p_jump = h*lambda (clamped to [0,1])."""
+    def __init__(self, *args, **kwargs):
+        kwargs["p_jump_mode"] = "dtmc"
+        super().__init__(*args, **kwargs)
+
+
 SOLVER_REGISTRY: dict[str, Type[Solver]] = {
     "mixture_euler": MixtureDiscreteEulerSolver,
+    "mixture_euler_dtmc": MixtureDiscreteEulerSolver_DTMC,
     "mixture_euler_shs": MixtureDiscreteEulerSolverSHS,
+    "mixture_euler_shs_dtmc": MixtureDiscreteEulerSolverSHS_DTMC,
     "mixture_euler_with_cumulative_scalar": MixtureDiscreteEleurSolverWithCumulativeScalar,
 }
 

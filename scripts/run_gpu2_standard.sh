@@ -2,6 +2,7 @@
 # GPU 2: Standard sampler (DFM + FS-DFM)
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES=2
+export MASTER_PORT=12346
 
 PROJ_DIR="/data1/seunghwan/fs-dfm"
 CONDA_ENV="seunghwan_fs-dfm"
