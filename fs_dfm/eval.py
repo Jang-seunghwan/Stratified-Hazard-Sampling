@@ -66,6 +66,7 @@ def generate_samples_teacher_model(
         )
         dist.barrier()
 
+    samples = torch.cat(samples, dim=0)
     return samples
 
 
@@ -215,27 +216,6 @@ def generate_samples_student_model(
         )
 
     samples = torch.cat(samples, dim=0)
-    # Free model from GPU before loading GPT2 for perplexity eval
-    model.cpu()
-    torch.cuda.empty_cache()
-    perplexity = evaluate.compute_perplexity(
-        samples=samples,
-        perplexity_batch_size=min(batch_size, 2),  # small batch to avoid OOM with GPT2
-    )
-    model.to(samples.device)  # restore for next NFE iteration
-    dist.all_reduce(perplexity, dist.ReduceOp.AVG)
-    entropy = evaluate.compute_entropy(samples=samples)
-    dist.all_reduce(entropy, dist.ReduceOp.AVG)
-    logger.log_metric(
-        value=perplexity.item(), name=f"Perplexity", stage="Evaluation", step=step
-    )
-    logger.log_metric(
-        value=entropy.item(), name=f"Entropy", stage="Evaluation", step=step
-    )
-
-    if rank == 0:
-        print(f"Step {step} -> Perplexity: {perplexity:.2f}, Entropy: {entropy:.2f}")
-
     dist.barrier()
     return samples
 
@@ -308,6 +288,82 @@ def calculate_perplexity(
             diagnostics_dir=diagnostics_dir,
             diagnostics_seed=diagnostics_seed,
         )
+
+    # --- Decode all samples ---
+    all_token_ids = torch.cat(samples, dim=0) if isinstance(samples, list) else samples
+    all_texts = tokenizer.batch_decode(all_token_ids)
+
+    # --- Save texts for MAUVE ---
+    if rank == 0 and diagnostics_dir:
+        os.makedirs(diagnostics_dir, exist_ok=True)
+        tag = "shs" if "shs" in solver_name else "default"
+        txt_path = os.path.join(diagnostics_dir, f"samples_{tag}_T{step}_seed{diagnostics_seed}.txt")
+        with open(txt_path, "w") as f:
+            for t in all_texts:
+                f.write(t.strip() + "\n")
+        print(f"[Eval] Saved {len(all_texts)} samples to {txt_path}")
+
+    # --- PPL ---
+    model.cpu()
+    torch.cuda.empty_cache()
+    perplexity = evaluate.compute_perplexity(
+        samples=all_token_ids,
+        perplexity_batch_size=min(batch_size, 2),
+    )
+    dist.all_reduce(perplexity, dist.ReduceOp.AVG)
+
+    # --- Entropy ---
+    entropy = evaluate.compute_entropy(samples=all_token_ids)
+    dist.all_reduce(entropy, dist.ReduceOp.AVG)
+
+    # --- MAUVE ---
+    mauve_score = None
+    try:
+        import mauve
+        if rank == 0 and len(all_texts) >= 100:
+            # Reference: real data from validation set
+            ref_texts = []
+            for batch in dataloader:
+                decoded = tokenizer.batch_decode(batch["input_ids"])
+                ref_texts.extend(decoded)
+                if len(ref_texts) >= len(all_texts):
+                    break
+            ref_texts = ref_texts[:len(all_texts)]
+            result = mauve.compute_mauve(
+                p_text=ref_texts, q_text=all_texts,
+                device_id=0, max_text_length=1024, verbose=False,
+            )
+            mauve_score = result.mauve
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[MAUVE] Error: {e}")
+
+    model.to(all_token_ids.device)
+
+    if rank == 0:
+        msg = f"Step {step} -> PPL: {perplexity:.2f}, Entropy: {entropy:.2f}"
+        if mauve_score is not None:
+            msg += f", MAUVE: {mauve_score:.4f}"
+        print(msg)
+
+        # Save summary
+        if diagnostics_dir:
+            import json
+            tag = "shs" if "shs" in solver_name else "default"
+            summary = {
+                "nfe": step, "seed": diagnostics_seed, "solver": solver_name,
+                "ppl": float(perplexity), "entropy": float(entropy),
+                "n_samples": len(all_texts),
+            }
+            if mauve_score is not None:
+                summary["mauve"] = float(mauve_score)
+            summary_path = os.path.join(diagnostics_dir, f"summary_{tag}_T{step}_seed{diagnostics_seed}.json")
+            with open(summary_path, "w") as f:
+                json.dump(summary, f, indent=2)
+
+    logger.log_metric(value=perplexity.item(), name="Perplexity", stage="Evaluation", step=step)
+    logger.log_metric(value=entropy.item(), name="Entropy", stage="Evaluation", step=step)
 
 
 def get_dt_grid(iloc, cfg, device, rev=False):
