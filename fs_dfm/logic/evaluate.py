@@ -24,21 +24,27 @@ from logic.flow import SourceDistribution
 
 @torch.no_grad()
 def compute_perplexity(samples: Tensor, perplexity_batch_size: int) -> Tensor:
+    # Free GPU memory before loading eval model (FS-DFM model may still be on GPU)
+    torch.cuda.empty_cache()
     eval_model = GPT2LMHeadModel.from_pretrained("gpt2-large").to(samples.device).eval()
     batches = samples.shape[0] // perplexity_batch_size
     total_perplexity = 0
 
-    for i in range(batches):
-        s = samples[i * perplexity_batch_size : (i + 1) * perplexity_batch_size]
-        _, logits = eval_model(s, labels=s)[:2]
-        logits = logits.transpose(-1, -2).detach()
+    with torch.no_grad():
+        for i in range(batches):
+            s = samples[i * perplexity_batch_size : (i + 1) * perplexity_batch_size]
+            _, logits = eval_model(s, labels=s)[:2]
+            logits = logits.transpose(-1, -2).detach()
 
-        perplexity = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none")
-        perplexity = perplexity.mean(dim=-1).exp().mean()
+            perplexity = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none")
+            perplexity = perplexity.mean(dim=-1).exp().mean()
 
-        total_perplexity += perplexity
+            total_perplexity += perplexity
 
     total_perplexity /= batches
+
+    del eval_model
+    torch.cuda.empty_cache()
 
     return total_perplexity
 

@@ -41,7 +41,9 @@ def load_model_from_path(
     else:
         ckpt_dir = work_dir
 
-    loaded_state = torch.load(ckpt_dir, map_location=device, weights_only=False)
+    # Load to CPU first to avoid OOM (FS-DFM checkpoints contain
+    # teacher + student + ema = ~16GB, won't fit on 24GB GPU at once)
+    loaded_state = torch.load(ckpt_dir, map_location='cpu', weights_only=False)
 
     # Support both checkpoint formats:
     #   Apple release: {"model": state_dict, "optimizer": ..., "step": ...}

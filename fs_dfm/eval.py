@@ -43,15 +43,11 @@ def generate_samples_teacher_model(
     diagnostics_seed: int = 0,
 ):
     samples = []
-    samples_left_500 = []
-    samples_left_250 = []
-    samples_per_25 = []
-    samples_per_50 = []
     for _ in range(perplexity_n_samples // batch_size):
         samples.append(
             generate.generate_samples(
                 model=WrappedModel(model=model),
-                step=step,  # 2 ** i
+                step=step,
                 sample_dir=work_dirs.samples,
                 vocab_size=vocab_size,
                 tokenizer=tokenizer,
@@ -61,104 +57,16 @@ def generate_samples_teacher_model(
                 source_distribution=source_distribution,
                 sample_batch_size=batch_size,
                 sequence_length=cfg.model.length,
-                sampling_steps=step,  # 2 ** i
+                sampling_steps=step,
                 time_epsilon=time_epsilon,
                 solver_name=solver_name,
                 diagnostics_dir=diagnostics_dir if rank == 0 else None,
                 diagnostics_seed=diagnostics_seed,
             )
         )
-
-        samples_left_500.append(
-            generate.generate_samples_with_dataset(
-                wrapped_model=WrappedModel(model=model),
-                solver_name=solver_name,
-                step=step,  # 2 ** i
-                sample_dir=work_dirs.samples,
-                vocab_size=vocab_size,
-                tokenizer=tokenizer,
-                rank=rank,
-                device=device,
-                path=path,
-                source_distribution=source_distribution,
-                sample_batch_size=batch_size,
-                sequence_length=cfg.model.length,
-                sampling_steps=step,  # 2 ** i
-                time_epsilon=time_epsilon,
-                dataloader=dataloader,
-                controller_mode="left_k",
-                controller_left_k=int(cfg.model.length / 2),
-            )
-        )
-
-        samples_left_250.append(
-            generate.generate_samples_with_dataset(
-                wrapped_model=WrappedModel(model=model),
-                solver_name=solver_name,
-                step=step,  # 2 ** i
-                sample_dir=work_dirs.samples,
-                vocab_size=vocab_size,
-                tokenizer=tokenizer,
-                rank=rank,
-                device=device,
-                path=path,
-                source_distribution=source_distribution,
-                sample_batch_size=batch_size,
-                sequence_length=cfg.model.length,
-                sampling_steps=step,  # 2 ** i
-                time_epsilon=time_epsilon,
-                dataloader=dataloader,
-                controller_mode="left_k",
-                controller_left_k=int(cfg.model.length / 4),
-            )
-        )
-
-        samples_per_25.append(
-            generate.generate_samples_with_dataset(
-                wrapped_model=WrappedModel(model=model),
-                solver_name=solver_name,
-                step=step,  # 2 ** i
-                sample_dir=work_dirs.samples,
-                vocab_size=vocab_size,
-                tokenizer=tokenizer,
-                rank=rank,
-                device=device,
-                path=path,
-                source_distribution=source_distribution,
-                sample_batch_size=batch_size,
-                sequence_length=cfg.model.length,
-                sampling_steps=step,  # 2 ** i
-                time_epsilon=time_epsilon,
-                dataloader=dataloader,
-                controller_mode="percentage",
-                controller_pct=0.25,
-            )
-        )
-
-        samples_per_50.append(
-            generate.generate_samples_with_dataset(
-                wrapped_model=WrappedModel(model=model),
-                solver_name=solver_name,
-                step=step,  # 2 ** i
-                sample_dir=work_dirs.samples,
-                vocab_size=vocab_size,
-                tokenizer=tokenizer,
-                rank=rank,
-                device=device,
-                path=path,
-                source_distribution=source_distribution,
-                sample_batch_size=batch_size,
-                sequence_length=cfg.model.length,
-                sampling_steps=step,  # 2 ** i
-                time_epsilon=time_epsilon,
-                dataloader=dataloader,
-                controller_mode="percentage",
-                controller_pct=0.5,
-            )
-        )
         dist.barrier()
 
-    return samples, samples_left_500, samples_left_250, samples_per_25, samples_per_50
+    return samples
 
 
 def do_generation(
@@ -219,10 +127,14 @@ def do_generation(
     if controller_mode == "left_k":
         value = controller_left_k
 
+    # Temporarily free main model to make room for GPT2 eval
+    model.cpu()
+    torch.cuda.empty_cache()
     perplexity = evaluate.compute_perplexity(
         samples=samples,
-        perplexity_batch_size=cfg.eval.perplexity_batch_size,
+        perplexity_batch_size=min(cfg.eval.perplexity_batch_size, 2),
     )
+    model.to(samples.device)
     dist.all_reduce(perplexity, dist.ReduceOp.AVG)
 
     entropy = evaluate.compute_entropy(samples=samples)
@@ -303,10 +215,14 @@ def generate_samples_student_model(
         )
 
     samples = torch.cat(samples, dim=0)
+    # Free model from GPU before loading GPT2 for perplexity eval
+    model.cpu()
+    torch.cuda.empty_cache()
     perplexity = evaluate.compute_perplexity(
         samples=samples,
-        perplexity_batch_size=batch_size,
+        perplexity_batch_size=min(batch_size, 2),  # small batch to avoid OOM with GPT2
     )
+    model.to(samples.device)  # restore for next NFE iteration
     dist.all_reduce(perplexity, dist.ReduceOp.AVG)
     entropy = evaluate.compute_entropy(samples=samples)
     dist.all_reduce(entropy, dist.ReduceOp.AVG)
@@ -319,31 +235,6 @@ def generate_samples_student_model(
 
     if rank == 0:
         print(f"Step {step} -> Perplexity: {perplexity:.2f}, Entropy: {entropy:.2f}")
-
-    do_generation(
-        model=model,
-        perplexity_n_samples=perplexity_n_samples,
-        step=step,
-        work_dirs=work_dirs,
-        vocab_size=vocab_size,
-        tokenizer=tokenizer,
-        rank=rank,
-        device=device,
-        path=path,
-        source_distribution=source_distribution,
-        cfg=cfg,
-        time_epsilon=time_epsilon,
-        controlled_unmasking=controlled_unmasking,
-        dataloader=dataloader,
-        controller_mode="percentage",
-        controller_left_k=0,
-        controller_pct=0.5,
-        return_metrics=True,
-        logger=logger,
-        do_dynamic_step=do_dynamic_step,
-        grid=grid,
-        solver_name=solver_name,
-    )
 
     dist.barrier()
     return samples
@@ -373,96 +264,50 @@ def calculate_perplexity(
 ):
     assert perplexity_n_samples // batch_size > 0
 
-    i = 0
+    step = sampling_steps
     if teacher_model:
-        i = 1
-    if do_dynamic_step:
-        i = 2
-    while 2**i <= sampling_steps:
-        if teacher_model:
-            (
-                samples,
-                samples_left_500,
-                samples_left_250,
-                samples_per_25,
-                samples_per_50,
-            ) = generate_samples_teacher_model(
-                perplexity_n_samples,
-                batch_size,
-                model,
-                work_dirs,
-                vocab_size,
-                tokenizer,
-                rank,
-                device,
-                path,
-                source_distribution,
-                cfg,
-                time_epsilon,
-                step=2**i,
-                dataloader=dataloader,
-                solver_name=solver_name,
-                diagnostics_dir=diagnostics_dir,
-                diagnostics_seed=diagnostics_seed,
-            )
-        if not teacher_model:
-            grid = None
-            step = 2**i
-            if do_dynamic_step:
-                grid = get_dt_grid(i, cfg, device)
-                step = i + 1
-                print(77 * "*")
-                print(grid)
-                print(77 * "*")
-            samples = generate_samples_student_model(
-                perplexity_n_samples,
-                batch_size,
-                model,
-                work_dirs,
-                vocab_size,
-                tokenizer,
-                rank,
-                device,
-                path,
-                source_distribution,
-                cfg,
-                time_epsilon,
-                step=step,
-                dataloader=dataloader,
-                logger=logger,
-                do_dynamic_step=do_dynamic_step,
-                grid=grid,
-                solver_name=solver_name,
-                diagnostics_dir=diagnostics_dir,
-                diagnostics_seed=diagnostics_seed,
-            )
-
-            if do_dynamic_step:
-                grid = get_dt_grid(i, cfg, device, True)
-                step = i + 1
-                print(77 * "*")
-                print(grid)
-                print(77 * "*")
-                samples = generate_samples_student_model(
-                    perplexity_n_samples,
-                    batch_size,
-                    model,
-                    work_dirs,
-                    vocab_size,
-                    tokenizer,
-                    rank,
-                    device,
-                    path,
-                    source_distribution,
-                    cfg,
-                    time_epsilon,
-                    step=step,
-                    dataloader=dataloader,
-                    logger=logger,
-                    do_dynamic_step=do_dynamic_step,
-                    grid=grid,
-                )
-        i += 1
+        samples = generate_samples_teacher_model(
+            perplexity_n_samples,
+            batch_size,
+            model,
+            work_dirs,
+            vocab_size,
+            tokenizer,
+            rank,
+            device,
+            path,
+            source_distribution,
+            cfg,
+            time_epsilon,
+            step=step,
+            dataloader=dataloader,
+            solver_name=solver_name,
+            diagnostics_dir=diagnostics_dir,
+            diagnostics_seed=diagnostics_seed,
+        )
+    else:
+        samples = generate_samples_student_model(
+            perplexity_n_samples,
+            batch_size,
+            model,
+            work_dirs,
+            vocab_size,
+            tokenizer,
+            rank,
+            device,
+            path,
+            source_distribution,
+            cfg,
+            time_epsilon,
+            step=step,
+            dataloader=dataloader,
+            logger=logger,
+            do_dynamic_step=do_dynamic_step,
+            grid=None,
+            solver_name=solver_name,
+            diagnostics_dir=diagnostics_dir,
+            diagnostics_seed=diagnostics_seed,
+        )
 
 
 def get_dt_grid(iloc, cfg, device, rev=False):
