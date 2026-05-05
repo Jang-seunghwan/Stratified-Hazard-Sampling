@@ -293,14 +293,15 @@ def calculate_perplexity(
     all_token_ids = torch.cat(samples, dim=0) if isinstance(samples, list) else samples
     all_texts = tokenizer.batch_decode(all_token_ids)
 
-    # --- Save texts for MAUVE ---
+    # --- Save texts (one sample per line, newlines within replaced) ---
     if rank == 0 and diagnostics_dir:
         os.makedirs(diagnostics_dir, exist_ok=True)
         tag = "shs" if "shs" in solver_name else "default"
         txt_path = os.path.join(diagnostics_dir, f"samples_{tag}_T{step}_seed{diagnostics_seed}.txt")
         with open(txt_path, "w") as f:
             for t in all_texts:
-                f.write(t.strip() + "\n")
+                # Replace internal newlines so each sample is exactly one line
+                f.write(t.strip().replace("\n", " ") + "\n")
         print(f"[Eval] Saved {len(all_texts)} samples to {txt_path}")
 
     # --- PPL ---
@@ -325,12 +326,14 @@ def calculate_perplexity(
             ref_texts = []
             for batch in dataloader:
                 decoded = tokenizer.batch_decode(batch["input_ids"])
-                ref_texts.extend(decoded)
+                ref_texts.extend([t.strip().replace("\n", " ") for t in decoded])
                 if len(ref_texts) >= len(all_texts):
                     break
             ref_texts = ref_texts[:len(all_texts)]
+            # Clean generated texts too (remove internal newlines)
+            clean_gen = [t.strip().replace("\n", " ") for t in all_texts]
             result = mauve.compute_mauve(
-                p_text=ref_texts, q_text=all_texts,
+                p_text=ref_texts, q_text=clean_gen,
                 device_id=0, max_text_length=1024, verbose=False,
             )
             mauve_score = result.mauve
