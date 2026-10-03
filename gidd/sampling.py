@@ -89,20 +89,24 @@ class GiddSampler(Sampler):
 
 
 class GiddSamplerSHS(Sampler):
-    """GIDD Sampler with Stratified Hazard Sampling (SHS) for uniform noise part only.
+    """GIDD sampler with Systematic Hazard Sampling (SHS).
 
-    - [MASK] tokens: Standard probabilistic unmasking (unchanged)
-    - non-[MASK] tokens: SHS applied (hazard accumulation -> jump when threshold crossed)
+    [MASK] tokens are unmasked by the standard posterior sampler (same as `GiddSampler`).
+    Non-[MASK] tokens follow SHS: each position accumulates its jump mass
+    S += p_jump = 1 - q(z_s = z_t | z_t) and jumps whenever S >= theta + k, where
+    theta ~ U(0, 1) is drawn once per position and k is the number of jumps so far.
+    The destination of a jump is drawn from the posterior with the current token removed
+    and renormalized.
     """
 
     def __init__(self, model, tokenizer, noise_schedule: NoiseSchedule, t_eps=1e-4, compile_step=False, min_p=0.0):
         super().__init__(model, tokenizer, noise_schedule, t_eps=t_eps)
         self.min_p = min_p
         self.mask_id = tokenizer.mask_token_id
-        # Note: compile_step=False by default for SHS since the loop has dynamic control flow
+        # compile_step is unused: the SHS step has data-dependent control flow and runs eagerly
 
     def _compute_q_st(self, z_t, t, s):
-        """Compute posterior q(z_s | z_t) - same as GiddSampler.DenoisingStep"""
+        """Posterior q(z_s | z_t), identical to GiddSampler.DenoisingStep."""
         logits = self.model(z_t, t)
         logits[..., self.mask_id] = -1e6
 
@@ -133,51 +137,41 @@ class GiddSamplerSHS(Sampler):
         ts = torch.linspace(0, 1, num_denoising_steps + 1, device=device).unsqueeze(-1)
         ts = (1 - 2 * self.t_eps) * ts + self.t_eps
 
-        # Initialize z_t from prior (all [MASK] tokens)
         z_t = self.noise_schedule.sample_prior((num_samples, max_length)).to(device, non_blocking=True)
 
-        # === SHS state initialization (for non-[MASK] tokens only) ===
+        # SHS state: accumulated jump mass S, jump count k, random phase theta ~ U(0, 1)
         hazard_dtype = torch.float64
-        S = torch.zeros((num_samples, max_length), dtype=hazard_dtype, device=device)  # Cumulative hazard
-        k = torch.zeros((num_samples, max_length), dtype=torch.long, device=device)    # Jump counter
-        theta = torch.rand((num_samples, max_length), dtype=hazard_dtype, device=device)  # Random phase U(0,1)
+        S = torch.zeros((num_samples, max_length), dtype=hazard_dtype, device=device)
+        k = torch.zeros((num_samples, max_length), dtype=torch.long, device=device)
+        theta = torch.rand((num_samples, max_length), dtype=hazard_dtype, device=device)
 
         for i in tqdm.trange(num_denoising_steps - 1, -1, -1, desc="Generating (SHS)", disable=not show_progress, dynamic_ncols=True):
             t, s = ts[i], ts[max(0, i-1)]
 
-            # Compute posterior q(z_s | z_t)
             q_st = self._compute_q_st(z_t, t, s)
+            is_mask = (z_t == self.mask_id)
 
-            # Identify token states
-            is_mask = (z_t == self.mask_id)  # (batch, seq_len)
-
-            # === [MASK] tokens: Standard probabilistic sampling ===
+            # [MASK] tokens: standard posterior sampling
             mask_samples = sample_categorical(q_st)
 
-            # === non-[MASK] tokens: SHS ===
-            # p_stay = probability of staying at current token
-            p_stay = q_st.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)  # (batch, seq_len)
+            # non-[MASK] tokens: accumulate jump mass, jump when S crosses theta + k
+            p_stay = q_st.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
             p_jump = (1.0 - p_stay).clamp(0.0, 1.0).to(hazard_dtype)
-
-            # Only accumulate hazard for non-[MASK] positions
             p_jump_masked = p_jump.masked_fill(is_mask, 0.0)
             S = S + p_jump_masked
 
-            # Trigger jump when S crosses threshold (theta + k)
             threshold = theta + k.to(hazard_dtype)
             jump_mask = (S >= threshold) & (p_jump_masked > 0) & (~is_mask)
 
-            # Sample new tokens for jumped positions (excluding current token)
             shs_samples = z_t.clone()
             if jump_mask.any():
-                # Flatten for indexing
                 flat_jump = jump_mask.reshape(-1)
                 jump_idx = flat_jump.nonzero(as_tuple=False).squeeze(-1)
 
                 q_sel = q_st.reshape(-1, q_st.shape[-1]).index_select(0, jump_idx)
                 zt_sel = z_t.reshape(-1).index_select(0, jump_idx)
 
-                # Remove current token from distribution and renormalize
+                # destination: posterior with the current token removed, renormalized
                 q_sel = q_sel.clone()
                 q_sel.scatter_(1, zt_sel.unsqueeze(1), 0.0)
                 q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -188,12 +182,10 @@ class GiddSamplerSHS(Sampler):
                 shs_flat[jump_idx] = new_tokens
                 shs_samples = shs_flat.view_as(shs_samples)
 
-                # Update jump counter
                 k_flat = k.reshape(-1)
                 k_flat[jump_idx] += 1
                 k = k_flat.view_as(k)
 
-            # === Combine: [MASK] uses standard sampling, non-[MASK] uses SHS ===
             z_t = torch.where(is_mask, mask_samples, shs_samples)
 
         return z_t

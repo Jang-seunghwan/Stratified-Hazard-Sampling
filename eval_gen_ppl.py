@@ -2,7 +2,9 @@ from gidd import GiddPipeline
 import torch
 import torch.nn.functional as F
 import os
+import glob
 import json
+import random
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -10,14 +12,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="GIDD Sampling Experiment with Generative PPL")
+    parser = argparse.ArgumentParser(description="GIDD sampling: Generative PPL and Entropy (Standard vs. SHS)")
     parser.add_argument("--mode", type=str, default="default", choices=["default", "shs"],
-                        help="Sampling mode: 'default' or 'shs' (Stratified Hazard Sampling)")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2],
-                        help="Seeds to test (e.g., --seeds 0 1 2)")
-    parser.add_argument("--nfes", type=int, nargs="+", default=[128],
-                        help="NFE (num_inference_steps) values to test (e.g., --nfes 64 128 256)")
-    parser.add_argument("--num_samples", type=int, default=64,
+                        help="Sampling mode: 'default' (Standard) or 'shs' (Systematic Hazard Sampling)")
+    parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 4, 5],
+                        help="Seeds to run (e.g., --seeds 1 2 3 4 5)")
+    parser.add_argument("--nfes", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128, 256, 512],
+                        help="NFE (num_inference_steps) values to run (e.g., --nfes 64 128 256)")
+    parser.add_argument("--num_samples", type=int, default=1024,
                         help="Number of samples to generate per configuration")
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size for generation and PPL computation")
@@ -25,8 +27,8 @@ def parse_args():
                         help="Output directory for results")
     parser.add_argument("--model", type=str, default="dvruette/gidd-base-p_unif-0.2",
                         help="HuggingFace model name or path")
-    parser.add_argument("--no_self_correction", action="store_true",
-                        help="Skip self-correction step")
+    parser.add_argument("--self_correction", action="store_true",
+                        help="Run the GIDD self-correction step on the samples before evaluation (off in the paper)")
 
     # Generative PPL options
     parser.add_argument("--ppl_model", type=str, default="gpt2-large",
@@ -34,6 +36,14 @@ def parse_args():
     parser.add_argument("--no_ppl", action="store_true",
                         help="Skip generative PPL computation")
     return parser.parse_args()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def compute_generative_ppl(texts, ppl_model_name, batch_size=4, device="cuda"):
@@ -86,6 +96,35 @@ def compute_generative_ppl(texts, ppl_model_name, batch_size=4, device="cuda"):
     }
 
 
+def compute_entropy(texts, tokenizer, max_length=512):
+    """Pooled unigram entropy (nats) of all samples of a run.
+
+    The texts are re-tokenized with the GIDD tokenizer (no special tokens, truncated/padded to
+    `max_length`), pad tokens are dropped, and the entropy of the token frequencies is computed
+    over all remaining tokens.
+    """
+    ids = tokenizer(texts, return_tensors="pt", add_special_tokens=False, max_length=max_length,
+                    padding="max_length", truncation=True)["input_ids"].reshape(-1)
+    ids = ids[ids != tokenizer.pad_token_id]
+    _, counts = torch.unique(ids, return_counts=True)
+    return float(torch.special.entr(counts.float() / counts.sum()).sum())
+
+
+def write_summary(output_dir):
+    """Collect the metrics (without texts) of all runs in `output_dir` into summary.json."""
+    runs = []
+    for path in glob.glob(f"{output_dir}/seed*_nfe*.json"):
+        with open(path) as f:
+            run = json.load(f)
+        run.pop("generated_seqs", None)
+        runs.append(run)
+    runs.sort(key=lambda r: (r["nfe"], r["seed"]))
+    summary_path = f"{output_dir}/summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(runs, f, indent=2)
+    return summary_path, runs
+
+
 def main():
     args = parse_args()
 
@@ -101,6 +140,7 @@ def main():
     print(f"Seeds: {args.seeds}")
     print(f"NFEs: {args.nfes}")
     print(f"Samples per config: {args.num_samples}")
+    print(f"Self-correction: {args.self_correction}")
     print(f"PPL Model: {args.ppl_model}")
     print(f"Output: {output_dir}/")
     print()
@@ -110,9 +150,6 @@ def main():
     pipe = GiddPipeline.from_pretrained(args.model, trust_remote_code=True)
     pipe.to(device)
 
-    # Results storage
-    all_results = []
-
     # Run experiments: seed x NFE
     for seed in args.seeds:
         for nfe in args.nfes:
@@ -120,10 +157,7 @@ def main():
             print(f"Running: mode={mode_str}, seed={seed}, NFE={nfe}")
             print(f"{'='*60}")
 
-            # Set seed
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
+            set_seed(seed)
 
             # Generate samples (in batches)
             all_texts = []
@@ -140,8 +174,8 @@ def main():
 
             print(f"Generated {len(all_texts)} samples")
 
-            # Self-correction (optional)
-            if not args.no_self_correction:
+            # Self-correction (optional, not used in the paper)
+            if args.self_correction:
                 print("Running self-correction...")
                 corrected_texts = []
                 for i in range(0, len(all_texts), args.batch_size):
@@ -157,14 +191,15 @@ def main():
             else:
                 corrected_texts = all_texts
 
-            # Compute Generative PPL
             result = {
                 "mode": mode_str,
                 "seed": seed,
                 "nfe": nfe,
                 "num_samples": len(corrected_texts),
+                "self_correction": args.self_correction,
             }
 
+            # Generative PPL
             if not args.no_ppl:
                 ppl_metrics = compute_generative_ppl(
                     corrected_texts,
@@ -175,36 +210,29 @@ def main():
                 result.update(ppl_metrics)
                 print(f"\n>>> PPL: {ppl_metrics['ppl']:.2f} | NLL: {ppl_metrics['avg_nll']:.4f} | Acc: {ppl_metrics['acc']:.4f}")
 
-            all_results.append(result)
+            # Entropy
+            result["entropy"] = compute_entropy(corrected_texts, pipe.tokenizer)
+            print(f">>> Entropy: {result['entropy']:.4f}")
 
-            # Save individual result
+            result["generated_seqs"] = corrected_texts
+
             result_path = f"{output_dir}/seed{seed}_nfe{nfe}.json"
             with open(result_path, "w") as f:
                 json.dump(result, f, indent=2)
             print(f"Saved: {result_path}")
 
-            # Save sample texts
-            text_path = f"{output_dir}/seed{seed}_nfe{nfe}_samples.txt"
-            with open(text_path, "w") as f:
-                for i, text in enumerate(corrected_texts[:10]):  # Save first 10 samples
-                    f.write(f"=== Sample {i+1} ===\n{text}\n\n")
-            print(f"Saved: {text_path}")
-
-    # Save aggregated results
-    summary_path = f"{output_dir}/summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(all_results, f, indent=2)
+    # Metrics of all runs in the output directory
+    summary_path, runs = write_summary(output_dir)
     print(f"\n{'='*60}")
-    print(f"All results saved to: {summary_path}")
-
-    # Print summary table
-    if not args.no_ppl:
-        print(f"\n{'='*60}")
-        print(f"{'Mode':<10} {'Seed':<6} {'NFE':<6} {'PPL':<10} {'NLL':<10} {'Acc':<10}")
-        print(f"{'='*60}")
-        for r in all_results:
-            print(f"{r['mode']:<10} {r['seed']:<6} {r['nfe']:<6} {r['ppl']:<10.2f} {r['avg_nll']:<10.4f} {r['acc']:<10.4f}")
-        print(f"{'='*60}")
+    print(f"Summary of all runs in {output_dir}: {summary_path}")
+    print(f"{'='*60}")
+    print(f"{'Mode':<10} {'Seed':<6} {'NFE':<6} {'PPL':<10} {'NLL':<10} {'Acc':<10} {'Entropy':<10}")
+    print(f"{'='*60}")
+    for r in runs:
+        ppl = f"{r['ppl']:<10.2f} {r['avg_nll']:<10.4f} {r['acc']:<10.4f}" if "ppl" in r else f"{'-':<10} {'-':<10} {'-':<10}"
+        ent = f"{r['entropy']:<10.4f}" if "entropy" in r else "-"
+        print(f"{r['mode']:<10} {r['seed']:<6} {r['nfe']:<6} {ppl} {ent}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

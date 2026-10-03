@@ -8,6 +8,3 @@ wandb
 .vscode
 logs
 cache
-*.pdf
-*.png
-/trivial
