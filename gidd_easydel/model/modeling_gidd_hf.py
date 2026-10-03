@@ -1,3 +1,4 @@
+import math
 import typing as tp
 import warnings
 from functools import partial
@@ -888,7 +889,14 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
 
         p_s_t = q_s * q_t_s_at_z / q_t_at_z[..., None]
         p_s_t = p_s_t.clamp(min=0.0)
-        p_s_t = p_s_t / p_s_t.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        row_sums = p_s_t.sum(dim=-1, keepdim=True)
+        # Rows with no probability mass fall back to keeping the current token
+        degenerate = (row_sums < 1e-30).squeeze(-1)
+        if degenerate.any():
+            z_onehot = torch.nn.functional.one_hot(z, num_classes=p_s_t.shape[-1]).to(p_s_t.dtype)
+            p_s_t[degenerate] = z_onehot[degenerate]
+            row_sums = p_s_t.sum(dim=-1, keepdim=True)
+        p_s_t = p_s_t / row_sums.clamp(min=1e-12)
 
         z_next = torch.multinomial(p_s_t.flatten(0, 1), num_samples=1).view_as(z)
         return z_next
@@ -941,12 +949,13 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         top_p: float | None = None,
         top_k: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Stratified Hazard Sampling step for uniform diffusion.
+        """Systematic Hazard Sampling (SHS) step for uniform diffusion.
 
-        Instead of sampling each transition probabilistically, accumulates
-        jump probability into S. When S crosses threshold (theta + k),
-        a jump is triggered: the current token is excluded from the posterior
-        and a new token is sampled from the renormalized distribution.
+        Each non-[MASK] position accumulates its jump mass `S += 1 - p_stay` and jumps
+        whenever `S >= theta + k`, where `theta ~ U(0, 1)` is drawn once per position
+        (per block) and `k` is the number of jumps made so far. The destination is drawn
+        from the posterior with the current token removed and renormalized.
+        [MASK] positions are sampled from the posterior as in ancestral sampling.
         """
         hazard_dtype = torch.float64
 
@@ -978,21 +987,23 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         q_st = q_st.clamp(min=0.0)
         q_st = q_st / q_st.sum(dim=-1, keepdim=True).clamp(min=1e-12)
 
-        # Identify mask vs non-mask tokens
         is_mask = (z_t == mask_token_id)
 
-        # [MASK] tokens: standard probabilistic sampling from posterior
-        mask_samples = torch.multinomial(q_st.flatten(0, 1), num_samples=1).view_as(z_t)
+        # [MASK] positions: posterior sample (rows without mass fall back to uniform)
+        q_flat = q_st.flatten(0, 1)
+        degenerate = q_flat.sum(dim=-1) <= 0
+        if degenerate.any():
+            q_flat = q_flat.clone()
+            q_flat[degenerate] = 1.0
+        mask_samples = torch.multinomial(q_flat, num_samples=1).view_as(z_t)
 
-        # non-[MASK] tokens: SHS — accumulate hazard, jump when threshold crossed
+        # Non-[MASK] positions: accumulate jump mass, jump when S crosses theta + k
         p_stay = q_st.gather(-1, z_t.unsqueeze(-1)).squeeze(-1)
         p_jump = (1.0 - p_stay).clamp(0.0, 1.0).to(hazard_dtype)
 
-        # Only accumulate hazard for non-MASK positions
         p_jump_nm = p_jump.masked_fill(is_mask, 0.0)
         shs_S = shs_S + p_jump_nm
 
-        # Trigger jump when cumulative hazard S crosses threshold (theta + k)
         threshold = shs_theta + shs_k.to(hazard_dtype)
         jump_mask = (shs_S >= threshold) & (p_jump_nm > 0) & (~is_mask)
 
@@ -1004,25 +1015,25 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
             q_sel = q_st.reshape(-1, q_st.shape[-1]).index_select(0, jump_idx).to(torch.float32)
             zt_sel = z_t.reshape(-1).index_select(0, jump_idx)
 
-            # Remove current token from distribution and renormalize
+            # Destination: posterior without the current token, renormalized
             q_sel = q_sel.clone()
             q_sel.scatter_(1, zt_sel.unsqueeze(1), 0.0)
             q_sel = q_sel / q_sel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
+            degenerate = q_sel.sum(dim=-1) <= 0
+            if degenerate.any():
+                q_sel[degenerate] = 1.0
             new_tokens = torch.multinomial(q_sel, num_samples=1).squeeze(-1)
 
             shs_flat = shs_samples.reshape(-1)
             shs_flat[jump_idx] = new_tokens
             shs_samples = shs_flat.view_as(shs_samples)
 
-            # Update jump counter
             k_flat = shs_k.reshape(-1)
             k_flat[jump_idx] += 1
             shs_k = k_flat.view_as(shs_k)
 
-        # Combine: [MASK] uses standard sampling, non-[MASK] uses SHS
         z_next = torch.where(is_mask, mask_samples, shs_samples)
-
         return z_next, shs_S, shs_k
 
     @torch.no_grad()
@@ -1042,7 +1053,7 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         mask_token_id: int = 3,
         sampling_method: tp.Literal["ancestral", "adaptive", "shs"] = "ancestral",
         noise_schedule: tp.Literal["linear", "cosine"] | tp.Callable[[torch.Tensor], torch.Tensor] = "cosine",
-        tokens_per_step: int = 1,
+        tokens_per_step: int | None = None,
         show_progress: bool = False,
     ):
         r"""
@@ -1075,6 +1086,11 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
                 The token ID for the padding token.
             mask_token_id (`int`, *optional*, defaults to 3):
                 The token ID used as a placeholder for tokens that are yet to be generated.
+            sampling_method (`str`, *optional*, defaults to `"ancestral"`):
+                `"ancestral"` (standard ancestral sampling), `"adaptive"` (confidence-based decoding) or
+                `"shs"` (Systematic Hazard Sampling).
+            tokens_per_step (`int`, *optional*):
+                Number of tokens updated per step by `"adaptive"`. Defaults to `ceil(block_length / steps)`.
         Return:
             `torch.Tensor`: A string containing the generated token IDs, starting
             after the prompt and stopping at the first `eos_id` or `gen_length`.
@@ -1084,8 +1100,8 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
         if noise_schedule not in ["linear", "cosine"] and not callable(noise_schedule):
             raise ValueError("noise_schedule must be 'linear', 'cosine', or a callable function.")
 
-        import math
-        tokens_per_step = max(1, math.ceil(block_length / steps))
+        if tokens_per_step is None:
+            tokens_per_step = max(1, math.ceil(block_length / steps))
 
         if inputs is None:
             inputs = torch.tensor([[bos_token_id]], device=self.device, dtype=torch.long)
@@ -1152,12 +1168,14 @@ class GiddForDiffusionLM(GiddPreTrainedModel, GenerationMixin):
                 current_window_end = current_window_start + block_length
                 attn_mask = (noise_mask[..., :, None] >= noise_mask[..., None, :])
 
-                keep_logits = False
-                past_key_values = None
+                # SHS state (jump mass S, jump count k, phase theta), reset for every block
                 if sampling_method == "shs":
                     shs_S = torch.zeros((batch_size, block_length), dtype=torch.float64, device=self.device)
                     shs_k = torch.zeros((batch_size, block_length), dtype=torch.long, device=self.device)
                     shs_theta = torch.rand((batch_size, block_length), dtype=torch.float64, device=self.device)
+
+                keep_logits = False
+                past_key_values = None
                 for step in range(steps, 0, -1):
                     if past_key_values is None:
                         output = self.forward(

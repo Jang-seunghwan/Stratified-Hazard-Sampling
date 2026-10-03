@@ -8,6 +8,3 @@ outputs
 .ipynb_checkpoints
 *.egg-info
 plots
-*.json
-*.csv
-*.sh

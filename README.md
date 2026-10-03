@@ -1,174 +1,126 @@
-# SHS Sampling for GIDD (Scaling Discrete Diffusion LMs)
+# Systematic Hazard Sampling (SHS) — 3B uniform diffusion (GIDD-EasyDeL)
 
-This repository extends [GIDD-EasyDeL](https://github.com/dvruette/gidd-easydel) with
-**Stratified Hazard Sampling (SHS)** as an additional inference-time sampling method.
-Training code is unchanged; SHS is available alongside the original `ancestral` and `adaptive`
-methods via `sampling_method="shs"`.
+Official code for **Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models** (NeurIPS 2026).
 
-## SHS Paper
-- Title: **Stratified Hazard Sampling: Minimal-Variance Event Scheduling for CTMC/DTMC Discrete Diffusion and Flow Models**
-- Authors: **Seunghwan Jang, SooJean Han**
-- arXiv: **https://arxiv.org/abs/2601.02799**
+**Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>1</sup>  
+<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University &nbsp; <sup>†</sup>Corresponding author: jsh991124@kaist.ac.kr
 
-## Sampling Modes
+[[arXiv]](https://arxiv.org/abs/2601.02799) (an earlier version of the paper appeared on arXiv under the title *Stratified Hazard Sampling*)
 
-| Mode | Description |
-|------|-------------|
-| `ancestral` | Standard ancestral sampling (original GIDD) |
-| `adaptive` | Score-based adaptive token selection |
-| `shs` | Stratified Hazard Sampling (variance reduction) |
+SHS is a training-free, hyperparameter-free drop-in replacement for the per-step stay-vs.-replace decisions of CTMC/DTMC samplers.
+Instead of drawing an independent Bernoulli change decision at every step, each position accumulates its jump mass
+`S_i = sum_k p_ik` and jumps whenever `S_i` crosses `theta_i + k` (`k = 0, 1, ...`), with a single random phase `theta_i ~ U(0,1)` per position.
+This keeps the expected number of jumps and the destination distribution unchanged while minimizing the jump-count variance (at most 1/4 for a fixed cumulative mass).
 
----
+This branch applies SHS to **the 3B uniform-noise diffusion language model `dvruette/gidd-unif-3b` of von Rütte et al. (2025) (block-wise generation, 256 tokens, PyTorch inference path)**.
 
-## Original Paper
+| Branch | Model | Base code |
+|---|---|---|
+| [`main`](https://github.com/Jang-seunghwan/Systematic-Hazard-Sampling/tree/main) | UDLM (`kuleshov-group/udlm-lm1b`) | [kuleshov-group/discrete-diffusion-guidance](https://github.com/kuleshov-group/discrete-diffusion-guidance) |
+| [`gidd`](https://github.com/Jang-seunghwan/Systematic-Hazard-Sampling/tree/gidd) | GIDD (`dvruette/gidd-base-p_unif-0.2`) | [dvruette/gidd](https://github.com/dvruette/gidd) |
+| [`gidd-easydel`](https://github.com/Jang-seunghwan/Systematic-Hazard-Sampling/tree/gidd-easydel) | 3B uniform diffusion (`dvruette/gidd-unif-3b`) | [dvruette/gidd-easydel](https://github.com/dvruette/gidd-easydel) |
+| [`fs-dfm`](https://github.com/Jang-seunghwan/Systematic-Hazard-Sampling/tree/fs-dfm) | DFM 1.3B (Apple FS-DFM release) | [apple/ml-fs-dfm](https://github.com/apple/ml-fs-dfm) |
 
-Dimitri von Rütte, Janis Fluri, Antonio Orvieto, Omead Pooladzandi, Bernhard Schölkopf, Thomas Hofmann
+## Setup
 
+All results of the paper for this model use the PyTorch inference path, which only needs PyTorch and `transformers`
+(tested with Python 3.11, `torch==2.5.1`, `transformers==4.57.6`, one RTX 4090):
 
-[![arXiv](https://img.shields.io/badge/arXiv-2512.10858-d22c2c.svg)](https://arxiv.org/abs/2512.10858)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Scaling%20GIDD-f59a0c)](https://huggingface.co/collections/dvruette/scaling-behavior-of-discrete-diffusion-language-models)
+```bash
+git clone -b gidd-easydel https://github.com/Jang-seunghwan/Systematic-Hazard-Sampling.git
+cd Systematic-Hazard-Sampling
+pip install torch==2.5.1 transformers==4.57.6 accelerate numpy tqdm
+```
 
-This repository contains the code to reproduce the experiments from the paper "Scaling Behavior of Discrete Diffusion Language Models".
-It includes implementations of the model architecture, training procedures, and evaluation code used in the study.
-The implementation is based on [EasyDeL](https://github.com/erfanzar/EasyDeL), a JAX-based framework for training and running LLMs at scale.
+Weights, config and tokenizer are downloaded from the HuggingFace Hub ([`dvruette/gidd-unif-3b`](https://huggingface.co/dvruette/gidd-unif-3b); the paper used revision `b0357ea`),
+and the Gen PPL evaluator from [`gpt2-large`](https://huggingface.co/gpt2-large).
+The model *code* is not taken from the Hub: the Hub's remote code does not contain SHS, so the model class is loaded from the
+local file `gidd_easydel/model/modeling_gidd_hf.py` (no `trust_remote_code`).
 
-In our paper, we investigate the scaling behavior of discrete diffusion language models (DLMs) for different noise types (masking, uniform, and hybrid-noise), finding that all of them scale well in compute-bound settings and especially in token-bound settings, with uniform noise coming out on top for the latter.
-To confirm these findings, we train scaled-up models to compute optimality.
-Specifically, we train two 3B models (masked and uniform diffusion) as well as a 10B parameter uniform diffusion model, which, to the best of our knowledge, is the largest public uniform diffusion model to date.
-Below we plot the compute-bound and token-bound scaling laws for all investigated noise types with the scaled-up runs (3B and 10B) overlayed as circles.
+The JAX / EasyDeL training and evaluation code of the base repository (`main*.py`, `eval_ray.py`, `gidd_easydel/`) is kept unchanged;
+see [dvruette/gidd-easydel](https://github.com/dvruette/gidd-easydel) for its setup (JAX, EasyDeL/eformer forks) and usage.
 
-[![Scaling laws of discrete diffusion language models](thumbnail.png)](https://arxiv.org/abs/2512.10858)
-
-| Model | Size | Train. PPL | Diffusion type | HuggingFace link |
-|:------|-----:|-----------:|:---------------|:-----------------|
-| `gidd-unif-10b` | 10B | 9.15 | uniform | https://huggingface.co/dvruette/gidd-unif-10b |
-| `gidd-mask-3b` | 3B | 11.3 | masked | https://huggingface.co/dvruette/gidd-mask-3b |
-| `gidd-unif-3b` | 3B | 11.7 | uniform | https://huggingface.co/dvruette/gidd-unif-3b |
-
-## Quick Start
-
-The 3B and 10B models are available as converted PyTorch models on HuggingFace and can be used as follows:
+## Quick start
 
 ```python
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from eval_gen_ppl import load_gidd_model
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "dvruette/gidd-unif-10b"
+model, tokenizer = load_gidd_model("dvruette/gidd-unif-3b", torch.bfloat16, "cuda")
+inputs = torch.full((4, 1), tokenizer.bos_token_id, dtype=torch.long, device="cuda")  # unconditional
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, torch_dtype=torch.bfloat16)
-model.eval().to(device)
-
-prompt = "In a shocking finding, scientist discovered a herd of unicorns living in a remote, previously unexplored valley, in the Andes Mountains. Even more surprising to the researchers was the fact that the unicorns spoke perfect English."
-inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=True).input_ids[:, :-1].to(device)
-
-# SHS sampling
-generated_ids = model.generate(
-    inputs=inputs,
-    max_length=128,
-    block_length=128,
-    steps=256,
-    sampling_method="shs",       # or "ancestral", "adaptive"
-    temperature=0.0,
-    show_progress=True,
-)
-
-print(tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0])
+for method in ["ancestral", "shs"]:  # Standard vs. SHS
+    torch.manual_seed(0)
+    ids = model.generate(inputs=inputs, max_length=256, block_length=128, steps=16,
+                         sampling_method=method, temperature=1.0)
+    print(method, tokenizer.batch_decode(ids, skip_special_tokens=True)[0][:300])
 ```
 
-## Gen-PPL Evaluation
+`sampling_method` is one of `"ancestral"` (Standard), `"shs"` (Systematic Hazard Sampling) and `"adaptive"`
+(the confidence-based decoding of the base repository); `steps` is the number of denoising steps (NFE) per block.
 
-Two-phase workflow: (1) generate unconditional samples with GIDD, (2) measure PPL with a reference AR model.
+A small end-to-end run of the evaluation (16 samples, NFE 16):
 
 ```bash
-# All three sampling modes, NFE=128, 3 seeds, 1000 samples each
-python eval_gen_ppl.py
-
-# Quick test
-python eval_gen_ppl.py --num_samples 16 --nfes 64 --seeds 0
-
-# SHS only
-python eval_gen_ppl.py --modes shs --nfes 128 --seeds 0 1 2
-
-# Generation only (PPL measured later)
-python eval_gen_ppl.py --phase gen
-
-# PPL only (using previously generated samples)
-python eval_gen_ppl.py --phase ppl
+python eval_gen_ppl.py --mode shs --nfe 16 --num_samples 16
 ```
 
-### Gen-PPL Parameters
+## Reproducing the paper results
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--modes` | `ancestral adaptive shs` | Sampling methods to evaluate |
-| `--nfes` | `128` | NFE (number of function evaluations / denoising steps) |
-| `--seeds` | `0 1 2` | Random seeds |
-| `--num_samples` | `1000` | Number of unconditional samples per mode |
-| `--ppl_model` | `Qwen/Qwen2.5-7B` | Reference AR model for PPL measurement |
-| `--phase` | `both` | `gen` / `ppl` / `both` |
-| `--temperature` | `1.0` | Sampling temperature |
-| `--model_name` | `dvruette/gidd-unif-3b` | GIDD model to evaluate |
-
-## GSM8K Evaluation
-
-Few-shot math reasoning benchmark evaluation.
+Table 1 (3B column, Gen PPL and Entropy of Standard and SHS for NFE 4, 8, 16, 32, 64, 128; seed 0; 1000 samples each):
 
 ```bash
-# SHS sampling
-python eval_gsm8k.py --sampling_method shs --steps 256
-
-# Ancestral sampling (default)
-python eval_gsm8k.py --sampling_method ancestral --steps 256
-
-# Adaptive sampling with temperature
-python eval_gsm8k.py --sampling_method adaptive --temperature 0.7
-
-# Manual batch size
-python eval_gsm8k.py --sampling_method shs --batch_size 4
+bash run_gen_ppl.sh
 ```
 
-### GSM8K Parameters
+which runs, for `mode` in `ancestral shs` and `nfe` in `4 8 16 32 64 128`,
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--sampling_method` | `ancestral` | `ancestral` / `adaptive` / `shs` |
-| `--steps` | `256` | Number of denoising steps per block |
-| `--temperature` | `1.0` | Sampling temperature (0.0 = greedy) |
-| `--n_shots` | `8` | Number of few-shot examples (0-8) |
-| `--batch_size` | auto | Batch size (auto-detected if not set) |
-| `--model_name` | `dvruette/gidd-unif-3b` | GIDD model to evaluate |
-
-## Code Structure (SHS additions)
-
-```
-gidd_easydel/model/modeling_gidd_hf.py
-├── _sample_shs()              # SHS sampling (PyTorch/HuggingFace)
-└── generate()                 # Updated: sampling_method="shs" option added
-
-gidd_easydel/sampling.py
-├── shs_sampling_step()        # SHS sampling (JAX, for training)
-└── generate()                 # Updated: SHS state init + sampling call
-
-eval_gen_ppl.py                # Gen-PPL evaluation (ancestral/adaptive/shs)
-eval_gsm8k.py                  # GSM8K benchmark evaluation
+```bash
+python eval_gen_ppl.py --mode $mode --nfe $nfe --seed 0
 ```
 
-For training, setup, and original evaluation scripts, see the original repository: [https://github.com/dvruette/gidd-easydel](https://github.com/dvruette/gidd-easydel)
+The defaults of `eval_gen_ppl.py` are the paper protocol: 1000 unconditional samples per run, generated from the BOS token
+with `max_length=256` (two blocks of `block_length=128`, `--nfe` steps per block), temperature 1.0, model in bf16, batch size 4,
+with `torch.manual_seed(seed)` set once before generation.
+Adaptive decoding can be added with `MODES="ancestral adaptive shs" bash run_gen_ppl.sh`;
+`run_gen_ppl.sh` also reads `NFES`, `SEEDS`, `NUM_SAMPLES`, `OUTPUT_DIR` and `PYTHON` from the environment.
+
+- **Gen PPL**: GPT-2 Large (fp32) on the non-empty samples (batch 8, right-padded, truncated to 512 tokens); exp of the token-averaged NLL pooled over all samples (scored positions: `attention_mask[:, :-1]`). No sample is removed.
+- **Entropy**: entropy (nats) of the unigram distribution of the GPT-2 token ids pooled over all non-empty samples.
+
+Each run writes `outputs/gen_ppl/{mode}_nfe{nfe}_seed{seed}.json` with the settings, `gen_ppl`, `avg_nll`, `entropy`,
+the number of scored texts/tokens and the generated `texts`.
+On one RTX 4090, a run of 1000 samples takes about 0.5 h at NFE 4 and about 13 h at NFE 128.
+
+Reference values (seed 0, computed with `eval_gen_ppl.py` on the samples used in the paper):
+
+| NFE | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| Standard Gen PPL | 936.3 | 443.4 | 221.4 | 150.2 | 113.7 | 104.9 |
+| SHS Gen PPL | 869.5 | 417.2 | 218.1 | 142.0 | 113.0 | 99.6 |
+| Standard Entropy | 6.758 | 6.660 | 6.612 | 6.649 | 6.654 | 6.649 |
+| SHS Entropy | 6.634 | 6.536 | 6.554 | 6.588 | 6.619 | 6.618 |
+
+Samples are reproduced token-for-token only with the same GPU type and library versions; elsewhere, floating-point differences give different (statistically equivalent) samples.
+
+## What SHS changes in this codebase
+
+- `gidd_easydel/model/modeling_gidd_hf.py` (PyTorch model, used for all results):
+  - `GiddForDiffusionLM._sample_shs`: the SHS step (new).
+  - `GiddForDiffusionLM.generate`: `sampling_method="shs"`; the SHS state (jump mass `S`, jump count `k`, phase `theta`) is reset for every block.
+  - `GiddForDiffusionLM._sample_ancestral` (Standard): the posterior is clamped to be non-negative and renormalized, and rows without probability mass keep the current token.
+  - `"adaptive"`: `tokens_per_step` defaults to `ceil(block_length / steps)` (was 1).
+- `gidd_easydel/sampling.py` (JAX / EasyDeL inference): `shs_sampling_step` and `generate(sampler="shs")`. Not used for the paper results.
+- `eval_gen_ppl.py`, `run_gen_ppl.sh`: Gen PPL / Entropy evaluation (new).
 
 ## Citation
-If you find this work useful in your research, please consider citing:
 
 ```bibtex
-@misc{jang2026stratifiedhazardsamplingminimalvariance,
-  title         = {Stratified Hazard Sampling: Minimal-Variance Event Scheduling for CTMC/DTMC Discrete Diffusion and Flow Models},
-  author        = {Seunghwan Jang and SooJean Han},
-  year          = {2026},
-  eprint        = {2601.02799},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2601.02799},
+@inproceedings{jang2026systematic,
+  title     = {Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models},
+  author    = {Jang, Seunghwan and Jeung, Wonje and Han, SooJean},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
 }
 ```
 
@@ -182,8 +134,7 @@ If you find this work useful in your research, please consider citing:
 ```
 
 ## Acknowledgements
-This code is adapted from:
-- **Scaling Behavior of Discrete Diffusion Language Models** [https://github.com/dvruette/gidd-easydel]
 
-## License
-This repository is released under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+This branch is built on [dvruette/gidd-easydel](https://github.com/dvruette/gidd-easydel), the code of
+"Scaling Behavior of Discrete Diffusion Language Models" (von Rütte et al., 2025), and uses their released `gidd-unif-3b` checkpoint.
+The code is released under the Apache License 2.0 of the base repository; see [LICENSE](LICENSE).

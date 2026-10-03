@@ -180,13 +180,14 @@ def shs_sampling_step(
     logits=None,
     partition_spec=None,
 ):
-    """Stratified Hazard Sampling step for uniform diffusion.
+    """Systematic Hazard Sampling (SHS) step for uniform diffusion (JAX).
 
-    Accumulates jump probability into S. When S crosses threshold (theta + k),
-    a jump is triggered: the current token is excluded from the posterior and
-    a new token is sampled from the renormalized distribution.
+    Each non-[MASK] position accumulates its jump mass `S += 1 - p_stay` and jumps
+    whenever `S >= theta + k`, where `theta ~ U(0, 1)` is drawn once per position
+    and `k` is the number of jumps made so far. The destination is drawn from the
+    posterior with the current token removed and renormalized. [MASK] positions are
+    sampled from the posterior as in ancestral sampling. `top_k` and `temp` are ignored.
     """
-    # Forward pass
     if logits is None:
         outputs = module(
             input_ids=input_ids,
@@ -195,7 +196,6 @@ def shs_sampling_step(
         logits = with_sharding_constraint(outputs.logits, partition_spec)
         logits = logits.at[..., mask_token_id].set(-1e6)
 
-    # Compute posterior using raw softmax (no temperature)
     x_hat = nn.softmax(logits.astype(jnp.float32))
 
     alpha_t = safe_sigmoid(log_snr_t)
@@ -221,15 +221,14 @@ def shs_sampling_step(
 
     q_st = q_s / q_t_at_zt * q_t_s_at_zt  # posterior (batch, seq_len, vocab)
 
-    # Identify MASK vs non-MASK
     is_mask = (input_ids == mask_token_id)
     noise_mask_bool = noise_mask.astype(jnp.bool_)
 
-    # [MASK] tokens: standard posterior sampling
+    # [MASK] positions: posterior sample
     key, key_mask = jax.random.split(key)
     mask_samples = sample_categorical(key_mask, q_st)
 
-    # non-[MASK] tokens: SHS hazard accumulation
+    # Non-[MASK] positions: accumulate jump mass, jump when S crosses theta + k
     p_stay = jnp.take_along_axis(q_st, input_ids[..., None], axis=-1).squeeze(-1)
     p_jump = jnp.clip(1.0 - p_stay, 0.0, 1.0)
 
@@ -237,12 +236,10 @@ def shs_sampling_step(
     p_jump_masked = jnp.where(active_non_mask, p_jump, 0.0)
     shs_S = shs_S + p_jump_masked
 
-    # Check threshold: jump when S >= theta + k
     threshold = shs_theta + shs_k.astype(jnp.float32)
     jump_mask = (shs_S >= threshold) & (p_jump_masked > 0) & active_non_mask
 
-    # Sample new tokens for all positions (JIT-safe: no dynamic control flow)
-    # Remove current token from posterior and renormalize
+    # Destination: posterior without the current token, renormalized (sampled for all positions under jit)
     batch_size, seq_len = input_ids.shape
     batch_idx = jnp.arange(batch_size)[:, None]
     seq_idx = jnp.arange(seq_len)[None, :]
@@ -252,14 +249,11 @@ def shs_sampling_step(
     key, key_shs = jax.random.split(key)
     shs_new_tokens = sample_categorical(key_shs, q_jump)
 
-    # Apply jumps where threshold is crossed, else keep current token
     shs_samples = jnp.where(jump_mask, shs_new_tokens, input_ids)
     shs_k = shs_k + jump_mask.astype(jnp.int32)
 
-    # Combine: MASK uses standard sampling, non-MASK uses SHS
     next_ids = jnp.where(is_mask, mask_samples, shs_samples)
 
-    # Apply noise_mask: only update noisy positions
     next_input_ids = next_ids * noise_mask + input_ids * (1 - noise_mask)
 
     return next_input_ids, logits, shs_S, shs_k, shs_theta
@@ -365,7 +359,7 @@ def generate(
     for i in range(batch_size):
         noise_mask = noise_mask.at[i, prompt_lens[i] + max_completion_length :].set(False)
 
-    # SHS state initialization
+    # SHS state: jump mass S, jump count k, phase theta
     if sampler == "shs":
         key, key_theta = jax.random.split(key)
         shs_S = jnp.zeros_like(input_ids, dtype=jnp.float32)
