@@ -3,7 +3,9 @@
 Official code for **Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models** (NeurIPS 2026).
 
 **Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>1</sup>  
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University &nbsp; <sup>†</sup>Corresponding author: jsh991124@kaist.ac.kr
+<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University  
+Seunghwan Jang is now at Nanyang Technological University, and Wonje Jeung is now at the University of Michigan.  
+<sup>†</sup>Corresponding author: seunghwa001@e.ntu.edu.sg
 
 [[arXiv]](https://arxiv.org/abs/2601.02799) (an earlier version of the paper appeared on arXiv under the title *Stratified Hazard Sampling*)
 
@@ -123,6 +125,8 @@ UDLM and the base code:
 ```
 
 ## Acknowledgements
+
+We thank Albert No and Yair Schiff for helpful discussions and advice.
 
 This repository is built on [kuleshov-group/discrete-diffusion-guidance](https://github.com/kuleshov-group/discrete-diffusion-guidance)
 (Schiff et al., *Simple Guidance Mechanisms for Discrete Diffusion Models*), which builds on [MDLM](https://github.com/kuleshov-group/mdlm) and [SEDD](https://github.com/louaaron/Score-Entropy-Discrete-Diffusion),
