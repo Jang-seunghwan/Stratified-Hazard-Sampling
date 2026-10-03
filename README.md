@@ -2,9 +2,9 @@
 
 Official code for **Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models** (NeurIPS 2026).
 
-**Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>1</sup>  
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University  
-Seunghwan Jang is now at Nanyang Technological University, and Wonje Jeung is now at the University of Michigan.  
+**Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>3</sup>  
+<sup>1</sup>Nanyang Technological University &nbsp; <sup>2</sup>University of Michigan &nbsp; <sup>3</sup>KAIST  
+Work done while Seunghwan Jang was at KAIST and Wonje Jeung was at Yonsei University.  
 <sup>†</sup>Corresponding author: seunghwa001@e.ntu.edu.sg
 
 [[arXiv]](https://arxiv.org/abs/2601.02799) (an earlier version of the paper appeared on arXiv under the title *Stratified Hazard Sampling*)
