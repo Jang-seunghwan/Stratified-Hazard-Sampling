@@ -3,7 +3,9 @@
 Official code for **Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models** (NeurIPS 2026).
 
 **Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>1</sup>  
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University &nbsp; <sup>†</sup>Corresponding author: jsh991124@kaist.ac.kr
+<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University  
+Seunghwan Jang is now at Nanyang Technological University, and Wonje Jeung is now at the University of Michigan.  
+<sup>†</sup>Corresponding author: seunghwa001@e.ntu.edu.sg
 
 [[arXiv]](https://arxiv.org/abs/2601.02799) (an earlier version of the paper appeared on arXiv under the title *Stratified Hazard Sampling*)
 
@@ -138,6 +140,8 @@ The FS-DFM student path (`fs_dfm/run_eval.py` without `--teacher_model`, with th
 ```
 
 ## Acknowledgements
+
+We thank Albert No and Yair Schiff for helpful discussions and advice.
 
 This code is built on [apple/ml-fs-dfm](https://github.com/apple/ml-fs-dfm), the official implementation of *FS-DFM: Fast and Accurate Long Text Generation with Few-Step Diffusion Language Models* (Monsefi et al., 2025),
 which in turn builds on [Flow Matching](https://github.com/facebookresearch/flow_matching) from Meta; the DFM checkpoint is the one released by Apple with FS-DFM.
