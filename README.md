@@ -3,7 +3,9 @@
 Official code for **Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models** (NeurIPS 2026).
 
 **Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>1</sup>  
-<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University &nbsp; <sup>†</sup>Corresponding author: jsh991124@kaist.ac.kr
+<sup>1</sup>KAIST &nbsp; <sup>2</sup>Yonsei University  
+Seunghwan Jang is now at Nanyang Technological University, and Wonje Jeung is now at the University of Michigan.  
+<sup>†</sup>Corresponding author: seunghwa001@e.ntu.edu.sg
 
 [[arXiv]](https://arxiv.org/abs/2601.02799) (an earlier version of the paper appeared on arXiv under the title *Stratified Hazard Sampling*)
 
@@ -134,6 +136,8 @@ Samples are reproduced token-for-token only with the same GPU type and library v
 ```
 
 ## Acknowledgements
+
+We thank Albert No and Yair Schiff for helpful discussions and advice.
 
 This branch is built on [dvruette/gidd-easydel](https://github.com/dvruette/gidd-easydel), the code of
 "Scaling Behavior of Discrete Diffusion Language Models" (von Rütte et al., 2025), and uses their released `gidd-unif-3b` checkpoint.
