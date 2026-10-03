@@ -39,6 +39,8 @@ sampling:
   batch_size: ${loader.eval_batch_size}
   num_sample_batches: 2  # Total samples: `num_gpus` * `batch_size` * `num_sample_batches`
   use_float64: False
+  sampling_mode: default  # default (standard per-step sampling) / shs (Systematic Hazard Sampling)
+  save_jump_stats: False  # gen_ppl_eval: also save per-position jump counts / cumulative jump mass (.npz)
 
 training:
   ema: 0.9999

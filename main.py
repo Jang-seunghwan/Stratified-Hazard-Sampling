@@ -4,6 +4,7 @@ import os
 import fsspec
 import hydra
 import lightning as L
+import numpy as np
 import omegaconf
 import rich.syntax
 import rich.tree
@@ -162,10 +163,21 @@ def _gen_ppl_eval(config, tokenizer):
   pretrained = _load_from_checkpoint(
     config=config, tokenizer=tokenizer)
   pretrained.eval()
+  sampling_mode = config.sampling.sampling_mode
+  save_jump_stats = config.sampling.save_jump_stats
   samples = []
+  jump_stats = {'token_ids': [], 'jump_counts': [], 'cumulative_mass': []}
   for _ in tqdm(range(config.sampling.num_sample_batches),
                 desc='Gen. batches', leave=False):
-    sample = pretrained.sample(use_shs=True)
+    if save_jump_stats:
+      sample, stats = pretrained.sample(
+        sampling_mode=sampling_mode, return_jump_stats=True)
+      jump_stats['token_ids'].append(sample.cpu())
+      jump_stats['jump_counts'].append(stats['jump_counts'].cpu())
+      jump_stats['cumulative_mass'].append(
+        stats['cumulative_mass'].float().cpu())
+    else:
+      sample = pretrained.sample(sampling_mode=sampling_mode)
     samples.extend(
       pretrained.tokenizer.batch_decode(sample))
 
@@ -183,6 +195,17 @@ def _gen_ppl_eval(config, tokenizer):
   ]
   del pretrained  # free up space for eval
   print(f"Generated {len(samples)} samples.")
+
+  if save_jump_stats:
+    # Per-position jump counts / cumulative jump mass, saved next to the json
+    jump_stats_path = (
+      os.path.splitext(config.eval.generated_samples_path)[0]
+      + '_jump_stats.npz')
+    np.savez_compressed(
+      jump_stats_path,
+      **{key: torch.cat(value).numpy()
+         for key, value in jump_stats.items()})
+    print(f"Saved jump statistics to {jump_stats_path}")
 
   generative_ppl = eval_utils.compute_generative_ppl(
     samples,
@@ -204,6 +227,9 @@ def _gen_ppl_eval(config, tokenizer):
     json.dump({
       'generative_ppl': generative_ppl,
       'entropy': entropy,
+      'sampling_mode': sampling_mode,
+      'steps': config.sampling.steps,
+      'seed': config.seed,
       'generated_seqs': samples,
     },
       f, indent=4) # type: ignore

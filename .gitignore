@@ -5,3 +5,4 @@ __pycache__/
 .hf_cache
 outputs/
 watch_folder/
+config_tree.txt
