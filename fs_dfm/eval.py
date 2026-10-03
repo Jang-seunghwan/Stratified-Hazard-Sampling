@@ -5,11 +5,13 @@
 
 
 import datetime
+import json
 import os
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from torch import nn
 
 from data import data
@@ -39,8 +41,6 @@ def generate_samples_teacher_model(
     step,
     dataloader,
     solver_name: str = "mixture_euler",
-    diagnostics_dir: str = None,
-    diagnostics_seed: int = 0,
 ):
     samples = []
     for _ in range(perplexity_n_samples // batch_size):
@@ -48,7 +48,7 @@ def generate_samples_teacher_model(
             generate.generate_samples(
                 model=WrappedModel(model=model),
                 step=step,
-                sample_dir=work_dirs.samples,
+                sample_dir=None,
                 vocab_size=vocab_size,
                 tokenizer=tokenizer,
                 rank=rank,
@@ -60,10 +60,10 @@ def generate_samples_teacher_model(
                 sampling_steps=step,
                 time_epsilon=time_epsilon,
                 solver_name=solver_name,
-                diagnostics_dir=diagnostics_dir if rank == 0 else None,
-                diagnostics_seed=diagnostics_seed,
             )
         )
+        # Avoid allocator fragmentation over many batches
+        torch.cuda.empty_cache()
         dist.barrier()
 
     samples = torch.cat(samples, dim=0)
@@ -92,9 +92,7 @@ def do_generation(
     logger,
     do_dynamic_step,
     grid,
-    solver_name: str = None,
 ):
-    _solver = solver_name if solver_name is not None else cfg.flow.student_solver
 
     samples, metrics = generate.generate_few_steps_samples_with_dataset(
         wrapped_model=WrappedModel(model=model),
@@ -109,7 +107,7 @@ def do_generation(
         sequence_length=cfg.model.length,
         sampling_steps=step,
         time_epsilon=time_epsilon,
-        student_solver=_solver,
+        student_solver=cfg.flow.student_solver,
         unmask_change=cfg.training.unmask_change,
         controlled_unmasking=controlled_unmasking,
         can_apply_dt=cfg.training.can_apply_dt,
@@ -128,14 +126,10 @@ def do_generation(
     if controller_mode == "left_k":
         value = controller_left_k
 
-    # Temporarily free main model to make room for GPT2 eval
-    model.cpu()
-    torch.cuda.empty_cache()
     perplexity = evaluate.compute_perplexity(
         samples=samples,
-        perplexity_batch_size=min(cfg.eval.perplexity_batch_size, 2),
+        perplexity_batch_size=cfg.eval.perplexity_batch_size,
     )
-    model.to(samples.device)
     dist.all_reduce(perplexity, dist.ReduceOp.AVG)
 
     entropy = evaluate.compute_entropy(samples=samples)
@@ -180,8 +174,6 @@ def generate_samples_student_model(
     do_dynamic_step,
     grid,
     solver_name: str = None,
-    diagnostics_dir: str = None,
-    diagnostics_seed: int = 0,
 ):
     samples = []
     controlled_unmasking = cfg.training.controlled_unmasking
@@ -203,15 +195,13 @@ def generate_samples_student_model(
                 sequence_length=cfg.model.length,
                 sampling_steps=step,
                 time_epsilon=time_epsilon,
-                sample_dir=work_dirs.samples,
+                sample_dir=None,
                 student_solver=_solver,
                 unmask_change=cfg.training.unmask_change,
                 controlled_unmasking=controlled_unmasking,
                 can_apply_dt=cfg.training.can_apply_dt,
                 do_dynamic_step=do_dynamic_step,
                 grid=grid,
-                diagnostics_dir=diagnostics_dir if rank == 0 else None,
-                diagnostics_seed=diagnostics_seed,
             )
         )
 
@@ -239,8 +229,9 @@ def calculate_perplexity(
     dataloader,
     do_dynamic_step,
     solver_name: str = "mixture_euler",
-    diagnostics_dir: str = None,
-    diagnostics_seed: int = 0,
+    output_dir: str = None,
+    run_name: str = "eval",
+    run_info: dict = None,
 ):
     assert perplexity_n_samples // batch_size > 0
 
@@ -262,8 +253,6 @@ def calculate_perplexity(
             step=step,
             dataloader=dataloader,
             solver_name=solver_name,
-            diagnostics_dir=diagnostics_dir,
-            diagnostics_seed=diagnostics_seed,
         )
     else:
         samples = generate_samples_student_model(
@@ -285,88 +274,68 @@ def calculate_perplexity(
             do_dynamic_step=do_dynamic_step,
             grid=None,
             solver_name=solver_name,
-            diagnostics_dir=diagnostics_dir,
-            diagnostics_seed=diagnostics_seed,
         )
 
-    # --- Decode all samples ---
-    all_token_ids = torch.cat(samples, dim=0) if isinstance(samples, list) else samples
-    all_texts = tokenizer.batch_decode(all_token_ids)
-
-    # --- Save texts (one sample per line, newlines within replaced) ---
-    if rank == 0 and diagnostics_dir:
-        os.makedirs(diagnostics_dir, exist_ok=True)
-        tag = "shs" if "shs" in solver_name else "default"
-        txt_path = os.path.join(diagnostics_dir, f"samples_{tag}_T{step}_seed{diagnostics_seed}.txt")
-        with open(txt_path, "w") as f:
-            for t in all_texts:
-                # Replace internal newlines so each sample is exactly one line
-                f.write(t.strip().replace("\n", " ") + "\n")
-        print(f"[Eval] Saved {len(all_texts)} samples to {txt_path}")
-
-    # --- PPL ---
+    # Gen PPL: corpus-level exp(sum NLL / #tokens) under GPT-2 Large
     model.cpu()
     torch.cuda.empty_cache()
-    perplexity = evaluate.compute_perplexity(
-        samples=all_token_ids,
-        perplexity_batch_size=min(batch_size, 2),
-    )
-    dist.all_reduce(perplexity, dist.ReduceOp.AVG)
+    nll_sum, n_tokens = evaluate.compute_gen_ppl_nll(samples=samples, batch_size=4)
+    dist.all_reduce(nll_sum, dist.ReduceOp.SUM)
+    dist.all_reduce(n_tokens, dist.ReduceOp.SUM)
+    gen_ppl = torch.exp(nll_sum / n_tokens)
+    model.to(samples.device)
 
-    # --- Entropy ---
-    entropy = evaluate.compute_entropy(samples=all_token_ids)
+    entropy = evaluate.compute_entropy(samples=samples)
     dist.all_reduce(entropy, dist.ReduceOp.AVG)
 
-    # --- MAUVE ---
-    mauve_score = None
-    try:
-        import mauve
-        if rank == 0 and len(all_texts) >= 100:
-            # Reference: real data from validation set
-            ref_texts = []
-            for batch in dataloader:
-                decoded = tokenizer.batch_decode(batch["input_ids"])
-                ref_texts.extend([t.strip().replace("\n", " ") for t in decoded])
-                if len(ref_texts) >= len(all_texts):
-                    break
-            ref_texts = ref_texts[:len(all_texts)]
-            # Clean generated texts too (remove internal newlines)
-            clean_gen = [t.strip().replace("\n", " ") for t in all_texts]
-            result = mauve.compute_mauve(
-                p_text=ref_texts, q_text=clean_gen,
-                device_id=0, max_text_length=1024, verbose=False,
-            )
-            mauve_score = result.mauve
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[MAUVE] Error: {e}")
-
-    model.to(all_token_ids.device)
+    all_samples = _gather_from_ranks(samples)
 
     if rank == 0:
-        msg = f"Step {step} -> PPL: {perplexity:.2f}, Entropy: {entropy:.2f}"
-        if mauve_score is not None:
-            msg += f", MAUVE: {mauve_score:.4f}"
-        print(msg)
+        print(f"Step {step} -> Gen PPL: {gen_ppl:.3f}, Entropy: {entropy:.3f}")
 
-        # Save summary
-        if diagnostics_dir:
-            import json
-            tag = "shs" if "shs" in solver_name else "default"
-            summary = {
-                "nfe": step, "seed": diagnostics_seed, "solver": solver_name,
-                "ppl": float(perplexity), "entropy": float(entropy),
-                "n_samples": len(all_texts),
-            }
-            if mauve_score is not None:
-                summary["mauve"] = float(mauve_score)
-            summary_path = os.path.join(diagnostics_dir, f"summary_{tag}_T{step}_seed{diagnostics_seed}.json")
-            with open(summary_path, "w") as f:
-                json.dump(summary, f, indent=2)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            texts = tokenizer.batch_decode(all_samples)
+            txt_path = os.path.join(output_dir, f"{run_name}.txt")
+            _write_samples_one_per_line(texts, txt_path)
 
-    logger.log_metric(value=perplexity.item(), name="Perplexity", stage="Evaluation", step=step)
+            result = dict(run_info or {})
+            result.update(
+                {
+                    "nfe": step,
+                    "n_samples": len(texts),
+                    "batch_size": batch_size,
+                    "gen_ppl": gen_ppl.item(),
+                    "gen_ppl_eval_model": "gpt2-large",
+                    "entropy": entropy.item(),
+                    "samples_file": os.path.basename(txt_path),
+                }
+            )
+            json_path = os.path.join(output_dir, f"{run_name}.json")
+            with open(json_path, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"[Eval] Saved {len(texts)} samples to {txt_path}")
+            print(f"[Eval] Saved results to {json_path}")
+
+    logger.log_metric(value=gen_ppl.item(), name="GenPPL", stage="Evaluation", step=step)
     logger.log_metric(value=entropy.item(), name="Entropy", stage="Evaluation", step=step)
+
+
+def _gather_from_ranks(x: torch.Tensor) -> torch.Tensor:
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return x
+    parts = [torch.empty_like(x) for _ in range(world_size)]
+    dist.all_gather(parts, x)
+    return torch.cat(parts, dim=0)
+
+
+def _write_samples_one_per_line(texts, path):
+    """One sample per line; backslashes and in-sample newlines are escaped."""
+    with open(path, "w") as f:
+        for t in texts:
+            line = t.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+            f.write(line + "\n")
 
 
 def get_dt_grid(iloc, cfg, device, rev=False):
@@ -398,6 +367,8 @@ def run_eval(
     do_dynamic_step: bool = True,
     use_shs: bool = False,
     use_dtmc: bool = False,
+    config_path: str = None,
+    cache_dir: str = None,
 ) -> None:
     torch.manual_seed(seed + rank)
 
@@ -407,7 +378,12 @@ def run_eval(
     work_dirs.checkpoint = Path(pre_trained_model_path)
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
-    cfg = checkpointing.load_cfg_from_path(work_dir=work_dirs.checkpoint)
+    if config_path is None:
+        cfg = checkpointing.load_cfg_from_path(work_dir=work_dirs.checkpoint)
+    else:
+        cfg = OmegaConf.load(config_path)
+    if cache_dir is not None:
+        cfg.data.cache_dir = cache_dir
     logger = logging.TrainLogger(log_dir=work_dirs.root, rank=rank, cfg=cfg)
     logger.info(work_dirs)
     logger.info(cfg)
@@ -462,27 +438,30 @@ def run_eval(
         model = torch.compile(model)
         torch.set_float32_matmul_precision("high")
 
-    data_state = data._get_dataset(
-        name=elbo_data,
-        mode="validation",
-        cache_dir=cfg.data.cache_dir,
-        block_size=cfg.model.length,
-        num_proc=cfg.data.num_workers,
-        batch_size=batch_size,
-        ngpus=world_size,
-        force_process=cfg.data.force_process,
-    )
+    # The validation data is only needed for the ELBO
+    dataloader = None
+    if eval_elbo:
+        data_state = data._get_dataset(
+            name=elbo_data,
+            mode="validation",
+            cache_dir=cfg.data.cache_dir,
+            block_size=cfg.model.length,
+            num_proc=cfg.data.num_workers,
+            batch_size=batch_size,
+            ngpus=world_size,
+            force_process=cfg.data.force_process,
+        )
 
-    dataloader = DataLoader(
-        data_state.dataset,
-        batch_size=batch_size,
-        sampler=data_state.sampler,
-        num_workers=cfg.data.num_workers,
-        pin_memory=True,
-        shuffle=(data_state.sampler is None),
-    )
+        dataloader = DataLoader(
+            data_state.dataset,
+            batch_size=batch_size,
+            sampler=data_state.sampler,
+            num_workers=cfg.data.num_workers,
+            pin_memory=True,
+            shuffle=(data_state.sampler is None),
+        )
 
-    # 2x2 조합: {standard, shs} x {ctmc, dtmc}
+    # Sampler: {Standard, SHS} x per-step jump probability {CTMC, DTMC}
     if use_shs and use_dtmc:
         solver_name = "mixture_euler_shs_dtmc"
     elif use_shs:
@@ -494,11 +473,18 @@ def run_eval(
     if rank == 0:
         print(f"[Eval] Solver: {solver_name}")
 
-    # Set up diagnostics directory
-    diagnostics_dir = os.path.join(work_dir, "diagnostics")
-    if rank == 0:
-        os.makedirs(diagnostics_dir, exist_ok=True)
-        print(f"[Eval] Diagnostics will be saved to: {diagnostics_dir}")
+    sampler = "shs" if use_shs else "standard"
+    p_jump_mode = "dtmc" if use_dtmc else "ctmc"
+    model_name = "dfm" if teacher_model else "fsdfm"
+    run_name = f"{model_name}_{sampler}_{p_jump_mode}_nfe{sampling_steps}_seed{seed}"
+    run_info = {
+        "model": model_name,
+        "sampler": sampler,
+        "p_jump_mode": p_jump_mode,
+        "solver": solver_name,
+        "seed": seed,
+        "world_size": world_size,
+    }
 
     if eval_perplexity:
         calculate_perplexity(
@@ -520,8 +506,9 @@ def run_eval(
             dataloader=dataloader,
             do_dynamic_step=do_dynamic_step,
             solver_name=solver_name,
-            diagnostics_dir=diagnostics_dir,
-            diagnostics_seed=seed,
+            output_dir=work_dir,
+            run_name=run_name,
+            run_info=run_info,
         )
 
     if eval_elbo:
@@ -581,6 +568,8 @@ def run_mp_eval(
     do_dynamic_step: bool = False,
     use_shs: bool = False,
     use_dtmc: bool = False,
+    config_path: str = None,
+    cache_dir: str = None,
 ) -> None:
     try:
         setup(rank=rank, world_size=world_size, port=port)
@@ -600,6 +589,8 @@ def run_mp_eval(
             do_dynamic_step=do_dynamic_step,
             use_shs=use_shs,
             use_dtmc=use_dtmc,
+            config_path=config_path,
+            cache_dir=cache_dir,
         )
     finally:
         cleanup()

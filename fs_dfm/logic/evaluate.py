@@ -49,6 +49,33 @@ def compute_perplexity(samples: Tensor, perplexity_batch_size: int) -> Tensor:
     return total_perplexity
 
 
+@torch.no_grad()
+def compute_gen_ppl_nll(samples: Tensor, batch_size: int = 4):
+    """Token NLL of generated sequences under GPT-2 Large (fp32).
+
+    The generated token ids are scored directly (no re-tokenization, no
+    attention mask); every position except the first is scored. Returns
+    (nll_sum, n_tokens) as float64 tensors; the corpus-level Gen PPL is
+    exp(nll_sum / n_tokens).
+    """
+    torch.cuda.empty_cache()
+    eval_model = GPT2LMHeadModel.from_pretrained("gpt2-large").to(samples.device).eval()
+    nll_sum = torch.zeros((), dtype=torch.float64, device=samples.device)
+    n_tokens = torch.zeros((), dtype=torch.float64, device=samples.device)
+
+    for i in range(0, samples.shape[0], batch_size):
+        s = samples[i : i + batch_size]
+        logits = eval_model(s).logits.transpose(-1, -2)
+        nll = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none")
+        nll_sum += nll.double().sum()
+        n_tokens += nll.numel()
+
+    del eval_model
+    torch.cuda.empty_cache()
+
+    return nll_sum, n_tokens
+
+
 def _sample_entropy(sample: List) -> float:
     histogram = Counter(sample)
     total = sum(histogram.values())
