@@ -1,5 +1,7 @@
 # Systematic Hazard Sampling (SHS) — DFM
 
+Project page: https://jang-seunghwan.github.io/Systematic-Hazard-Sampling/
+
 Official code for **Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models** (NeurIPS 2026).
 
 **Seunghwan Jang**<sup>1,†</sup>, **Wonje Jeung**<sup>2</sup>, **SooJean Han**<sup>3</sup>  
