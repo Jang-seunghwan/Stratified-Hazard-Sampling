@@ -88,21 +88,13 @@ The paper samples were generated on an NVIDIA RTX 4090; other GPUs or library ve
 The training and evaluation code of GIDD is otherwise unchanged; see the [upstream README](https://github.com/dvruette/gidd) for training and the original evaluation scripts.
 
 ## Citation
+
 ```bibtex
 @inproceedings{jang2026systematic,
   title     = {Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models},
   author    = {Jang, Seunghwan and Jeung, Wonje and Han, SooJean},
   booktitle = {Advances in Neural Information Processing Systems},
   year      = {2026}
-}
-```
-
-```bibtex
-@inproceedings{vonrutte2025generalized,
-  title     = {Generalized Interpolating Discrete Diffusion},
-  author    = {von R{\"u}tte, Dimitri and Fluri, Janis and Ding, Yuhui and Orvieto, Antonio and Sch{\"o}lkopf, Bernhard and Hofmann, Thomas},
-  booktitle = {International Conference on Machine Learning},
-  year      = {2025}
 }
 ```
 
