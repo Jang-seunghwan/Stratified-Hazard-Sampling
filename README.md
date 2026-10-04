@@ -116,28 +116,13 @@ Relative to [apple/ml-fs-dfm](https://github.com/apple/ml-fs-dfm):
 The FS-DFM student path (`fs_dfm/run_eval.py` without `--teacher_model`, with the FS-DFM checkpoint) and the training code are kept from upstream but are not used in the paper; see the [upstream README](https://github.com/apple/ml-fs-dfm) for training.
 
 ## Citation
+
 ```bibtex
 @inproceedings{jang2026systematic,
   title     = {Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models},
   author    = {Jang, Seunghwan and Jeung, Wonje and Han, SooJean},
   booktitle = {Advances in Neural Information Processing Systems},
   year      = {2026}
-}
-```
-
-```bibtex
-@article{monsefi2025fsdfm,
-  title   = {FS-DFM: Fast and Accurate Long Text Generation with Few-Step Diffusion Language Models},
-  author  = {Monsefi, Amin Karimi and Bhendawade, Nikhil and Ciosici, Manuel Rafael and Culver, Dominic and Zhang, Yizhe and Belousova, Irina},
-  journal = {arXiv preprint arXiv:2509.20624},
-  year    = {2025}
-}
-
-@inproceedings{gat2024discrete,
-  title     = {Discrete Flow Matching},
-  author    = {Gat, Itai and Remez, Tal and Shaul, Neta and Kreuk, Felix and Chen, Ricky T. Q. and Synnaeve, Gabriel and Adi, Yossi and Lipman, Yaron},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2024}
 }
 ```
 
