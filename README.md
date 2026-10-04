@@ -107,22 +107,13 @@ Relative to [kuleshov-group/discrete-diffusion-guidance](https://github.com/kule
 - `scripts/eval_udlm_gen_ppl.sh` (new): the paper grid.
 
 ## Citation
+
 ```bibtex
 @inproceedings{jang2026systematic,
   title     = {Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models},
   author    = {Jang, Seunghwan and Jeung, Wonje and Han, SooJean},
   booktitle = {Advances in Neural Information Processing Systems},
   year      = {2026}
-}
-```
-
-UDLM and the base code:
-```bibtex
-@article{schiff2024discreteguidance,
-  title   = {Simple Guidance Mechanisms for Discrete Diffusion Models},
-  author  = {Schiff, Yair and Sahoo, Subham Sekhar and Phung, Hao and Wang, Guanghan and Boshar, Sam and Dalla-torre, Hugo and de Almeida, Bernardo P and Rush, Alexander and Pierrot, Thomas and Kuleshov, Volodymyr},
-  journal = {arXiv preprint arXiv:2412.10193},
-  year    = {2024}
 }
 ```
 
