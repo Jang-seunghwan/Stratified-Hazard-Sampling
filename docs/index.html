@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Systematic Hazard Sampling</title>
+<meta name="description" content="Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models. NeurIPS 2026.">
+<style>
+  :root { --text: #1b1d21; --muted: #5a5f69; --link: #1a5fb4; --rule: #e3e5e9; --band: #f4f5f7; }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: #fff; color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+         font-size: 17px; line-height: 1.6; }
+  a { color: var(--link); }
+  .col { max-width: 720px; margin: 0 auto; padding: 0 16px; }
+  header { text-align: center; padding: 48px 0 8px; }
+  h1 { font-size: 2rem; line-height: 1.25; margin: 0 0 18px; font-weight: 700; }
+  .authors { font-size: 1.1rem; margin: 0 0 4px; }
+  .affil { color: var(--muted); margin: 0 0 4px; }
+  .affil span { display: inline-block; margin: 0 8px; }
+  .notes { color: var(--muted); font-size: 0.9rem; margin: 0 0 10px; }
+  .notes span { display: inline-block; margin: 0 6px; }
+  .venue { font-weight: 600; margin: 0 0 18px; }
+  .buttons { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 0 0 8px; }
+  .buttons a { display: inline-block; padding: 7px 18px; border: 1px solid var(--text); border-radius: 999px;
+               color: var(--text); text-decoration: none; font-weight: 600; font-size: 0.95rem; }
+  .buttons a:hover { background: var(--text); color: #fff; }
+  .tldr { margin: 28px 0 8px; padding: 16px 18px; border-left: 3px solid var(--text); background: #fafbfc; }
+  .tldr b { margin-right: 6px; }
+  section { margin: 40px 0; }
+  h2 { font-size: 1.4rem; line-height: 1.3; margin: 0 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+  p { margin: 0 0 12px; }
+  ul { margin: 0 0 12px; padding-left: 1.3em; }
+  li { margin: 0 0 6px; }
+  figure { margin: 22px 0 6px; position: relative; left: 50%; transform: translateX(-50%);
+           width: min(760px, calc(100vw - 32px)); }
+  figure.wide { width: min(960px, calc(100vw - 32px)); }
+  figure img { display: block; width: 100%; height: auto; margin: 0 auto; }
+  .fig-row { display: flex; gap: 16px; align-items: flex-start; margin: 22px 0 6px; position: relative; left: 50%;
+             transform: translateX(-50%); width: min(760px, calc(100vw - 32px)); }
+  .fig-row figure { margin: 0; position: static; left: auto; transform: none; width: auto; min-width: 0; flex: var(--ar) 1 0; }
+  .fig-row figcaption { font-size: 0.86rem; }
+  figcaption { max-width: 720px; margin: 10px auto 0; color: var(--muted); font-size: 0.92rem; text-align: center; }
+  .code-row { display: flex; gap: 16px; margin: 22px 0 6px; }
+  .code-row > div { flex: 1 1 0; min-width: 0; }
+  .code-label { font-size: 0.86rem; font-weight: 600; color: var(--muted); margin: 0 0 4px; }
+  pre.code { margin: 0; white-space: pre; overflow-x: auto; overflow-wrap: normal; }
+  pre.code .c { color: #8a8f99; }
+  .band { background: var(--band); padding: 36px 0 30px; margin: 56px 0 0; font-size: 0.94rem; }
+  .band section { margin: 0; }
+  .band h2 { border-bottom-color: #d9dce1; }
+  .cite { padding: 40px 0 56px; }
+  .cite section { margin: 0; }
+  .bib-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+              margin: 0 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+  .bib-head h2 { margin: 0; padding: 0; border: 0; }
+  button.copy { font: inherit; font-size: 0.85rem; padding: 4px 14px; border: 1px solid var(--text); border-radius: 999px;
+                background: #fff; color: var(--text); cursor: pointer; }
+  pre { margin: 6px 0 0; padding: 14px 16px; background: #f6f7f9; border: 1px solid var(--rule); border-radius: 6px;
+        font-size: 0.82rem; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+  @media (max-width: 600px) {
+    .fig-row, .code-row { flex-direction: column; gap: 22px; }
+    .fig-row figure { flex: none; width: 100%; }
+    body { font-size: 16px; }
+    header { padding-top: 32px; }
+    h1 { font-size: 1.5rem; }
+    .authors { font-size: 1rem; }
+    h2 { font-size: 1.25rem; }
+  }
+</style>
+</head>
+<body>
+
+<header class="col">
+  <h1>Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models</h1>
+  <p class="authors">Seunghwan Jang<sup>1*†</sup>, Wonje Jeung<sup>2‡</sup>, SooJean Han<sup>3</sup></p>
+  <p class="affil"><span><sup>1</sup>Nanyang Technological University</span><span><sup>2</sup>University of Michigan</span><span><sup>3</sup>KAIST</span></p>
+  <p class="notes"><span><sup>*</sup>Corresponding author</span><span><sup>†</sup>Work done at KAIST</span><span><sup>‡</sup>Work done at Yonsei University</span></p>
+  <p class="venue">NeurIPS 2026</p>
+  <nav class="buttons">
+    <a href="static/pdf/SHS_NeurIPS2026.pdf">Paper</a>
+    <!-- After arXiv v2 (2601.02799) is announced: delete the line above, uncomment the line below, and delete static/pdf/.
+    <a href="https://arxiv.org/abs/2601.02799">Paper</a>
+    -->
+    <a href="https://github.com/Jang-seunghwan/Systematic-Hazard-Sampling">Code</a>
+    <a href="https://openreview.net/forum?id=al6oaoCR5A">OpenReview</a>
+  </nav>
+</header>
+
+<main class="col">
+  <p class="tldr"><b>TL;DR</b>Uniform-noise discrete diffusion and flow models rewrite each token several times, and the standard sampler decides every rewrite by an independent coin flip. The number of edits per token then fluctuates more as the number of steps grows. SHS replaces the coin flips with one random phase per token and caps this variance at 1/4, with no retraining, hyperparameters, or extra forward passes.</p>
+
+  <section>
+    <h2>Too few edits, too many edits</h2>
+    <p>Uniform-noise discrete diffusion and flow models generate text by rewriting each token several times. Under the standard sampler, some tokens stop short with residual noise (under-editing); others keep being rewritten (over-editing).</p>
+    <figure class="wide">
+      <img src="static/images/overview.png" width="1920" height="733" alt="Standard sampler with under-edited and over-edited positions, versus SHS with threshold-triggered edits" loading="lazy">
+      <figcaption>(left) Standard sampler: independent per-step coin flips under-edit position 1 and over-edit position 4. (right) SHS: an edit is triggered when the accumulated jump mass crosses a unit-spaced threshold.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Why: independent coin flips</h2>
+    <p>Every token decides at every step, independently, whether to change. More steps make the variance of its jump count (number of edits) grow toward the total jump mass <i>S</i> instead of vanishing: 0.34 at NFE 4, 3.09 at NFE 128 on UDLM. Under-editing is what costs quality: token NLL rises steeply below the model-implied count.</p>
+    <figure>
+      <img src="static/images/count_deviation.png" width="1920" height="614" alt="Token NLL versus count deviation on UDLM at NFE 16 and NFE 128" loading="lazy">
+      <figcaption>Token NLL versus count deviation Δ<i>J</i> = <i>J</i> − round(<i>S</i>) on UDLM with the standard sampler, at NFE 16 (left) and 128 (right). Gray bars: number of positions.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Our method: one random phase per token</h2>
+    <ul>
+      <li>Accumulate each token's jump mass <i>S</i>: the sum of the change probabilities the model already outputs at each step.</li>
+      <li>Draw one phase <i>θ</i> ~ U(0, 1) per token; trigger an edit each time <i>S</i> crosses <i>θ</i>, <i>θ</i>+1, <i>θ</i>+2, …</li>
+      <li>The jump count becomes ⌊<i>S</i>⌋ or ⌈<i>S</i>⌉, <i>S</i> on average, with variance at most 1/4 at any NFE: the minimum for an integer count with mean <i>S</i>.</li>
+      <li>Which token gets written is unchanged. No retraining, hyperparameters, or extra forward passes.</li>
+    </ul>
+    <div class="code-row">
+      <div>
+        <p class="code-label">Standard sampler</p>
+<pre class="code">p = change_prob(x, t)
+if rand() &lt; p:        <span class="c"># coin flip</span>
+    x = sample_dest(x, t)</pre>
+      </div>
+      <div>
+        <p class="code-label">SHS</p>
+<pre class="code"><span class="c"># theta ~ U(0,1) once; S = m = 0</span>
+S += change_prob(x, t)
+if S &gt;= theta + m:
+    x = sample_dest(x, t)
+    m += 1</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Result: lower Gen. PPL at every NFE</h2>
+    <ul>
+      <li>Lower generative perplexity (Gen. PPL) on every model and NFE tested: up to 26% on GIDD and 17% on DFM.</li>
+      <li>On UDLM, jump-count variance stays below 1/4 under SHS while the standard sampler's reaches 3.09.</li>
+      <li>Stacks with nucleus sampling and temperature, lowering Gen. PPL further.</li>
+      <li>On GIDD, diversity moves toward real text and MAUVE rises from 0.38 to 0.54 at NFE 128.</li>
+    </ul>
+    <p>Tested on UDLM, GIDD, DFM, and a 3B uniform diffusion model (∼110M to ∼3B parameters).</p>
+    <div class="fig-row">
+      <figure style="--ar: 1.2727">
+        <img src="static/images/genppl_reduction.png" width="1260" height="990" alt="Gen. PPL reduction by SHS at each NFE for UDLM, GIDD, 3B, and DFM" loading="lazy">
+        <figcaption>Gen. PPL reduction by SHS over the standard sampler.</figcaption>
+      </figure>
+      <figure style="--ar: 1.2727">
+        <img src="static/images/variance.png" width="1260" height="990" alt="Jump-count variance versus NFE on UDLM for the standard sampler and SHS" loading="lazy">
+        <figcaption>Jump-count variance at fixed jump mass, UDLM.</figcaption>
+      </figure>
+    </div>
+  </section>
+</main>
+
+<div class="band">
+  <div class="col">
+    <section>
+      <h2>Limitations</h2>
+      <ul>
+        <li>SHS is not an exact simulator of the state-dependent process, and its guarantees hold for a given jump mass.</li>
+        <li>SHS keeps the expected jump count and does not explore biasing the count itself.</li>
+        <li>Experiments cover unconditional text generation.</li>
+      </ul>
+      <p>For details, see the paper.</p>
+    </section>
+  </div>
+</div>
+
+<div class="cite">
+  <div class="col">
+    <section>
+      <!-- Replace with the NeurIPS 2026 proceedings entry once it is available. -->
+      <div class="bib-head"><h2>Citation</h2><button class="copy" type="button" id="copy">Copy</button></div>
+<pre id="bibtex">@article{jang2026systematic,
+  title={Systematic Hazard Sampling: Minimal-Variance Inference for Discrete Diffusion and Flow Models},
+  author={Jang, Seunghwan and Jeung, Wonje and Han, SooJean},
+  journal={arXiv preprint arXiv:2601.02799},
+  year={2026}
+}</pre>
+    </section>
+  </div>
+</div>
+
+<script>
+  document.getElementById('copy').addEventListener('click', function () {
+    var b = this;
+    navigator.clipboard.writeText(document.getElementById('bibtex').textContent).then(function () {
+      b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1500);
+    });
+  });
+</script>
+</body>
+</html>
