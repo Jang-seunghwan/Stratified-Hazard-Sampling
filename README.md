@@ -128,15 +128,6 @@ Samples are reproduced token-for-token only with the same GPU type and library v
 }
 ```
 
-```bibtex
-@article{von2025scaling,
-  title={Scaling Behavior of Discrete Diffusion Language Models},
-  author={von R{\"u}tte, Dimitri and Fluri, Janis and Pooladzandi, Omead and Sch{\"o}lkopf, Bernhard and Hofmann, Thomas and Orvieto, Antonio},
-  journal={arXiv preprint arXiv:2512.10858},
-  year={2025}
-}
-```
-
 ## Acknowledgements
 
 We thank Albert No and Yair Schiff for helpful discussions and advice.
